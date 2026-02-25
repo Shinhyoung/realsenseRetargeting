@@ -1,0 +1,19 @@
+{
+	"FileVersion": 3,
+	"EngineAssociation": "5.7",
+	"Category": "",
+	"Description": "RealSense D455 Pose Retargeting via OSC",
+	"Modules": [
+		{
+			"Name": "PoseRetargeting",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "OSC",
+			"Enabled": true
+		}
+	]
+}
