@@ -32,6 +32,15 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Pose")
     AOSCPoseReceiver* OSCReceiver = nullptr;
 
+    /**
+     * 이 AnimInstance 가 추적할 사람 번호 (0-based)
+     * 여러 아바타를 배치하고 각각 0, 1, 2 로 설정하면
+     * 각 아바타가 다른 사람의 포즈를 따라감
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Pose",
+              meta = (ClampMin = "0", ClampMax = "2"))
+    int32 PersonIndex = 0;
+
     // ── 뼈 이름 ─────────────────────────────────────────────
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Pose|BoneNames")
     FName Neck_Bone      = TEXT("neck_01");

@@ -1,12 +1,16 @@
 """
 d455_pose3d_osc.py
-RealSense D455 + MediaPipe Pose → 전신 관절 OSC 송신 (27 관절)
+RealSense D455 + MediaPipe Pose → 전신 관절 OSC 송신 (다인원 지원)
 
 OSC 메시지 형식:
-  주소: /pose/<joint_name>
+  주소: /pose/<person_id>/<joint_name>
   인수: float x, float y, float z  (단위: m, 카메라 기준 좌표)
 
-  전신 관절 목록:
+  예시:
+    /pose/0/L_Shoulder  → 첫 번째 사람 왼쪽 어깨
+    /pose/1/R_Wrist     → 두 번째 사람 오른쪽 손목
+
+  전신 관절 목록 (27개):
     머리:  Nose, L_Eye, R_Eye, L_Ear, R_Ear
     상체:  L_Shoulder, R_Shoulder, L_Elbow, R_Elbow, L_Wrist, R_Wrist
     손:    L_Thumb, R_Thumb, L_Index, R_Index, L_Pinky, R_Pinky
@@ -37,33 +41,23 @@ import pythonosc.osc_bundle_builder as osc_bundle_builder
 # ══════════════════════════════════════════
 #  칼만 필터 (관절 좌표 지터 제거)
 # ══════════════════════════════════════════
-# Q: 프로세스 노이즈 (클수록 빠른 움직임 추적↑, 스무딩↓)
-# R: 측정 노이즈  (클수록 스무딩↑, 반응 속도↓)
-KALMAN_Q = 0.001   # 관절이 프레임 간 얼마나 변할 수 있는지
-KALMAN_R = 0.02    # 센서(깊이 카메라) 측정 노이즈 수준
+KALMAN_Q = 0.001   # 프로세스 노이즈 (클수록 빠른 움직임 추적↑)
+KALMAN_R = 0.02    # 측정 노이즈   (클수록 스무딩↑)
 
 
 class _KF1D:
-    """1축 스칼라 칼만 필터 (등속도 없는 상수 위치 모델)"""
+    """1축 스칼라 칼만 필터 (상수 위치 모델)"""
     __slots__ = ("x", "P", "Q", "R", "ready")
 
     def __init__(self, q: float, r: float):
-        self.Q = q
-        self.R = r
-        self.x = 0.0
-        self.P = 1.0
-        self.ready = False
+        self.Q = q; self.R = r
+        self.x = 0.0; self.P = 1.0; self.ready = False
 
     def update(self, z: float) -> float:
         if not self.ready:
-            self.x = z
-            self.ready = True
-            return z
-        # 예측
+            self.x = z; self.ready = True; return z
         P_pred = self.P + self.Q
-        # 칼만 게인
         K = P_pred / (P_pred + self.R)
-        # 상태 갱신
         self.x += K * (z - self.x)
         self.P = (1.0 - K) * P_pred
         return self.x
@@ -85,13 +79,25 @@ class JointKalmanFilter:
 
 
 # ══════════════════════════════════════════
+#  다인원 설정
+# ══════════════════════════════════════════
+MAX_PERSONS = 3   # 최대 검출 인원 (1~3)
+
+# 사람별 화면 표시 색상 (BGR)
+PERSON_COLORS = [
+    (0,   255, 255),   # 0번: 노란색
+    (0,   255,   0),   # 1번: 초록
+    (255, 100,   0),   # 2번: 파랑
+]
+
+# ══════════════════════════════════════════
 #  OSC 설정
 # ══════════════════════════════════════════
 OSC_IP   = "127.0.0.1"
 OSC_PORT = 9000
 
 osc_client = SimpleUDPClient(OSC_IP, OSC_PORT)
-print(f"[OSC] 송신 대상: {OSC_IP}:{OSC_PORT}")
+print(f"[OSC] 송신 대상: {OSC_IP}:{OSC_PORT}  (최대 {MAX_PERSONS}명)")
 
 # ══════════════════════════════════════════
 #  모델 경로
@@ -102,48 +108,41 @@ MODEL_PATH = r"c:\0.shinhyoung\Project\realsenseTest\pose_landmarker_lite.task"
 #  전신 관절 정의 (27개)
 # ══════════════════════════════════════════
 LANDMARKS = {
-    # ── 머리 ──────────────────────────────
-    "Nose":      PoseLandmark.NOSE,
-    "L_Eye":     PoseLandmark.LEFT_EYE,
-    "R_Eye":     PoseLandmark.RIGHT_EYE,
-    "L_Ear":     PoseLandmark.LEFT_EAR,
-    "R_Ear":     PoseLandmark.RIGHT_EAR,
-    # ── 상체 ──────────────────────────────
-    "L_Shoulder":PoseLandmark.LEFT_SHOULDER,
-    "R_Shoulder":PoseLandmark.RIGHT_SHOULDER,
-    "L_Elbow":   PoseLandmark.LEFT_ELBOW,
-    "R_Elbow":   PoseLandmark.RIGHT_ELBOW,
-    "L_Wrist":   PoseLandmark.LEFT_WRIST,
-    "R_Wrist":   PoseLandmark.RIGHT_WRIST,
-    # ── 손 ────────────────────────────────
-    "L_Thumb":   PoseLandmark.LEFT_THUMB,
-    "R_Thumb":   PoseLandmark.RIGHT_THUMB,
-    "L_Index":   PoseLandmark.LEFT_INDEX,
-    "R_Index":   PoseLandmark.RIGHT_INDEX,
-    "L_Pinky":   PoseLandmark.LEFT_PINKY,
-    "R_Pinky":   PoseLandmark.RIGHT_PINKY,
-    # ── 하체 ──────────────────────────────
-    "L_Hip":     PoseLandmark.LEFT_HIP,
-    "R_Hip":     PoseLandmark.RIGHT_HIP,
-    "L_Knee":    PoseLandmark.LEFT_KNEE,
-    "R_Knee":    PoseLandmark.RIGHT_KNEE,
-    "L_Ankle":   PoseLandmark.LEFT_ANKLE,
-    "R_Ankle":   PoseLandmark.RIGHT_ANKLE,
-    # ── 발 ────────────────────────────────
-    "L_Heel":    PoseLandmark.LEFT_HEEL,
-    "R_Heel":    PoseLandmark.RIGHT_HEEL,
-    "L_Foot":    PoseLandmark.LEFT_FOOT_INDEX,
-    "R_Foot":    PoseLandmark.RIGHT_FOOT_INDEX,
+    "Nose":       PoseLandmark.NOSE,
+    "L_Eye":      PoseLandmark.LEFT_EYE,
+    "R_Eye":      PoseLandmark.RIGHT_EYE,
+    "L_Ear":      PoseLandmark.LEFT_EAR,
+    "R_Ear":      PoseLandmark.RIGHT_EAR,
+    "L_Shoulder": PoseLandmark.LEFT_SHOULDER,
+    "R_Shoulder": PoseLandmark.RIGHT_SHOULDER,
+    "L_Elbow":    PoseLandmark.LEFT_ELBOW,
+    "R_Elbow":    PoseLandmark.RIGHT_ELBOW,
+    "L_Wrist":    PoseLandmark.LEFT_WRIST,
+    "R_Wrist":    PoseLandmark.RIGHT_WRIST,
+    "L_Thumb":    PoseLandmark.LEFT_THUMB,
+    "R_Thumb":    PoseLandmark.RIGHT_THUMB,
+    "L_Index":    PoseLandmark.LEFT_INDEX,
+    "R_Index":    PoseLandmark.RIGHT_INDEX,
+    "L_Pinky":    PoseLandmark.LEFT_PINKY,
+    "R_Pinky":    PoseLandmark.RIGHT_PINKY,
+    "L_Hip":      PoseLandmark.LEFT_HIP,
+    "R_Hip":      PoseLandmark.RIGHT_HIP,
+    "L_Knee":     PoseLandmark.LEFT_KNEE,
+    "R_Knee":     PoseLandmark.RIGHT_KNEE,
+    "L_Ankle":    PoseLandmark.LEFT_ANKLE,
+    "R_Ankle":    PoseLandmark.RIGHT_ANKLE,
+    "L_Heel":     PoseLandmark.LEFT_HEEL,
+    "R_Heel":     PoseLandmark.RIGHT_HEEL,
+    "L_Foot":     PoseLandmark.LEFT_FOOT_INDEX,
+    "R_Foot":     PoseLandmark.RIGHT_FOOT_INDEX,
 }
 
-# 화면에 좌표를 표시할 주요 관절 (전체 표시 시 화면 넘침 방지)
+# 화면에 좌표를 표시할 주요 관절
 DISPLAY_JOINTS = [
     "Nose",
     "L_Shoulder", "R_Shoulder",
-    "L_Elbow",    "R_Elbow",
     "L_Wrist",    "R_Wrist",
     "L_Hip",      "R_Hip",
-    "L_Knee",     "R_Knee",
     "L_Ankle",    "R_Ankle",
 ]
 
@@ -155,7 +154,7 @@ CONNECTIONS = list(PoseLandmarksConnections.POSE_LANDMARKS)
 options = PoseLandmarkerOptions(
     base_options=BaseOptions(model_asset_path=MODEL_PATH),
     running_mode=RunningMode.VIDEO,
-    num_poses=1,
+    num_poses=MAX_PERSONS,           # ← 다인원 검출
     min_pose_detection_confidence=0.5,
     min_tracking_confidence=0.5,
 )
@@ -180,19 +179,19 @@ color_intrinsics = (
 
 frame_timestamp_ms = 0
 
-# 관절별 칼만 필터 (첫 수신 시 자동 생성)
-kalman_filters: dict[str, JointKalmanFilter] = {}
+# 사람별 칼만 필터: {person_id: {joint_name: JointKalmanFilter}}
+kalman_filters: dict[int, dict[str, JointKalmanFilter]] = {}
 kalman_enabled = True   # 'k' 키로 ON/OFF
 
 
 # ══════════════════════════════════════════
-#  OSC Bundle 송신
+#  OSC Bundle 송신  /pose/<person_id>/<joint_name>
 # ══════════════════════════════════════════
-def send_osc_bundle(joint_data: dict):
-    """모든 관절을 하나의 OSC Bundle로 묶어 UDP 송신"""
+def send_osc_bundle(person_id: int, joint_data: dict):
+    """한 사람의 관절을 OSC Bundle로 묶어 UDP 송신"""
     builder = OscBundleBuilder(osc_bundle_builder.IMMEDIATELY)
     for name, (x, y, z) in joint_data.items():
-        msg = OscMessageBuilder(address=f"/pose/{name}")
+        msg = OscMessageBuilder(address=f"/pose/{person_id}/{name}")
         msg.add_arg(float(x))
         msg.add_arg(float(y))
         msg.add_arg(float(z))
@@ -230,80 +229,90 @@ try:
             cv2.COLORMAP_JET,
         )
 
+        detected_count = 0
+
         if results.pose_landmarks:
-            landmarks  = results.pose_landmarks[0]
-            joint_data = {}   # OSC 송신용: 전체 27개
+            detected_count = len(results.pose_landmarks)
 
-            # 스켈레톤 연결선
-            for conn in CONNECTIONS:
-                s = landmarks[conn.start]
-                e = landmarks[conn.end]
-                cv2.line(color_image,
-                         (int(s.x * w), int(s.y * h)),
-                         (int(e.x * w), int(e.y * h)),
-                         (200, 200, 200), 1)
+            for person_id, landmarks in enumerate(results.pose_landmarks):
+                color = PERSON_COLORS[person_id % len(PERSON_COLORS)]
 
-            # 모든 랜드마크 점 (초록)
-            for lm in landmarks:
-                px, py = int(lm.x * w), int(lm.y * h)
-                cv2.circle(color_image, (px, py), 3, (0, 255, 0), -1)
+                # 이 사람의 칼만 필터 초기화
+                if person_id not in kalman_filters:
+                    kalman_filters[person_id] = {}
 
-            # ── 전신 3D 좌표 계산 ──────────────────
-            y_offset = 18
-            for name, lm_id in LANDMARKS.items():
-                lm = landmarks[lm_id.value]
-                px, py = int(lm.x * w), int(lm.y * h)
-                px_c = max(0, min(px, w - 1))
-                py_c = max(0, min(py, h - 1))
+                # ── 스켈레톤 연결선 ──
+                for conn in CONNECTIONS:
+                    s = landmarks[conn.start]
+                    e = landmarks[conn.end]
+                    cv2.line(color_image,
+                             (int(s.x * w), int(s.y * h)),
+                             (int(e.x * w), int(e.y * h)),
+                             color, 1)
 
-                depth_val = depth_frame.get_distance(px_c, py_c)
-                point_3d  = rs.rs2_deproject_pixel_to_point(
-                    color_intrinsics, [px_c, py_c], depth_val
-                )
-                x3, y3, z3 = point_3d
+                # ── 랜드마크 점 ──
+                for lm in landmarks:
+                    px, py = int(lm.x * w), int(lm.y * h)
+                    cv2.circle(color_image, (px, py), 3, color, -1)
 
-                # 유효한 깊이만 칼만 필터 적용 후 송신
-                if depth_val > 0.0:
-                    if kalman_enabled:
-                        if name not in kalman_filters:
-                            kalman_filters[name] = JointKalmanFilter()
-                        x3, y3, z3 = kalman_filters[name].update(x3, y3, z3)
-                    joint_data[name] = (x3, y3, z3)
+                # ── 전신 3D 좌표 계산 + OSC 송신 ──
+                joint_data = {}
+                # 이 사람 박스 상단에 좌표 표시할 y 위치 계산
+                min_y = int(min(lm.y for lm in landmarks) * h)
+                y_offset = max(18, min_y)
 
-                # 주요 관절만 화면 표시
-                if name in DISPLAY_JOINTS:
-                    color  = (0, 255, 255) if depth_val > 0 else (0, 100, 200)
-                    cv2.circle(color_image, (px, py), 5, (0, 0, 255), -1)
-                    text = f"{name}:({x3:+.2f},{y3:+.2f},{z3:.2f})"
-                    cv2.putText(color_image, text, (10, y_offset),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.38, color, 1)
-                    y_offset += 17
+                for name, lm_id in LANDMARKS.items():
+                    lm = landmarks[lm_id.value]
+                    px, py = int(lm.x * w), int(lm.y * h)
+                    px_c = max(0, min(px, w - 1))
+                    py_c = max(0, min(py, h - 1))
 
-            # ── OSC Bundle 송신 (전체 27개) ────────
-            if joint_data:
-                try:
-                    send_osc_bundle(joint_data)
-                except Exception as e:
-                    print(f"[OSC] 송신 오류: {e}")
+                    depth_val = depth_frame.get_distance(px_c, py_c)
+                    point_3d  = rs.rs2_deproject_pixel_to_point(
+                        color_intrinsics, [px_c, py_c], depth_val
+                    )
+                    x3, y3, z3 = point_3d
 
-            # 상태 표시
-            cv2.putText(
-                color_image,
-                f"OSC -> {OSC_IP}:{OSC_PORT}  joints:{len(joint_data)}/27",
-                (10, h - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 200, 0), 1,
-            )
+                    if depth_val > 0.0:
+                        if kalman_enabled:
+                            kf = kalman_filters[person_id]
+                            if name not in kf:
+                                kf[name] = JointKalmanFilter()
+                            x3, y3, z3 = kf[name].update(x3, y3, z3)
+                        joint_data[name] = (x3, y3, z3)
+
+                    # 주요 관절 화면 표시
+                    if name in DISPLAY_JOINTS:
+                        cv2.circle(color_image, (px, py), 6, color, -1)
+                        # 사람 ID 포함 텍스트
+                        if name == "Nose":
+                            cv2.putText(color_image,
+                                        f"P{person_id}",
+                                        (px + 8, py),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                        text = f"P{person_id} {name}:({x3:+.2f},{z3:.2f}m)"
+                        cv2.putText(color_image, text, (10, y_offset),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
+                        y_offset += 15
+
+                # ── OSC 송신 ──
+                if joint_data:
+                    try:
+                        send_osc_bundle(person_id, joint_data)
+                    except Exception as e:
+                        print(f"[OSC] P{person_id} 송신 오류: {e}")
 
         else:
-            # 포즈 미검출 시 (0,0,0) 송신
-            try:
-                send_osc_bundle({n: (0.0, 0.0, 0.0) for n in LANDMARKS})
-            except Exception:
-                pass
             cv2.putText(color_image, "No Pose Detected", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-        # ── 칼만 필터 상태 표시 (우상단, 항상 표시) ──
+        # ── 상태 표시 (하단) ──
+        cv2.putText(color_image,
+                    f"OSC -> {OSC_IP}:{OSC_PORT}  Persons:{detected_count}/{MAX_PERSONS}",
+                    (10, h - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 200, 0), 1)
+
+        # ── 칼만 필터 상태 (우상단) ──
         kalman_label = "Kalman: ON  [K]" if kalman_enabled else "Kalman: OFF [K]"
         kalman_color = (0, 255, 100) if kalman_enabled else (0, 80, 255)
         cv2.putText(color_image, kalman_label,
@@ -312,14 +321,13 @@ try:
 
         # ── 화면 표시 ──
         display = np.hstack((color_image, depth_colormap))
-        cv2.imshow("D455 Full Body OSC | 'q' to quit", display)
+        cv2.imshow("D455 Multi-Person OSC | 'q' quit  'k' kalman", display)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
             break
         elif key == ord("k"):
             kalman_enabled = not kalman_enabled
-            # OFF 시 필터 상태 초기화 (재활성화 시 누적값 없이 시작)
             if not kalman_enabled:
                 kalman_filters.clear()
             print(f"[Kalman] {'ON' if kalman_enabled else 'OFF'}")

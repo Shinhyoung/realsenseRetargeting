@@ -43,7 +43,14 @@ void UPoseRetargetingAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
         return;
     }
 
-    const FPoseBoneResult& R = OSCReceiver->BoneResult;
+    // PersonIndex 범위 검사
+    if (!OSCReceiver->PersonBoneResults.IsValidIndex(PersonIndex))
+    {
+        bPoseValid = false;
+        return;
+    }
+
+    const FPoseBoneResult& R = OSCReceiver->PersonBoneResults[PersonIndex];
     bPoseValid = R.bHasData;
     if (!bPoseValid) return;
 

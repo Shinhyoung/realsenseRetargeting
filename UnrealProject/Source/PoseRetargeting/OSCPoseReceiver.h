@@ -24,42 +24,42 @@ struct FJointData
 };
 
 // ──────────────────────────────────────────
-//  전신 뼈대 쿼터니언 결과 (11 뼈대)
+//  한 사람의 관절 맵 래퍼 (TArray<TMap> 는 UPROPERTY 불가라서 래핑)
+// ──────────────────────────────────────────
+USTRUCT(BlueprintType)
+struct FPersonJointMap
+{
+    GENERATED_BODY()
+
+    UPROPERTY(BlueprintReadOnly, Category = "Pose")
+    TMap<FString, FJointData> Joints;
+};
+
+// ──────────────────────────────────────────
+//  전신 뼈대 쿼터니언 결과 (12 뼈대)
 // ──────────────────────────────────────────
 USTRUCT(BlueprintType)
 struct FPoseBoneResult
 {
     GENERATED_BODY()
 
-    // ── 머리/목 ──────────────────────────
-    /** 목  (어깨 중심 → 코) */
     UPROPERTY(BlueprintReadOnly, Category = "Pose") FQuat Neck        = FQuat::Identity;
-
-    // ── 척추 ─────────────────────────────
-    /** 척추 (골반 중심 → 어깨 중심) */
     UPROPERTY(BlueprintReadOnly, Category = "Pose") FQuat Spine       = FQuat::Identity;
-
-    // ── 팔 ───────────────────────────────
     UPROPERTY(BlueprintReadOnly, Category = "Pose") FQuat UpperArm_L  = FQuat::Identity;
     UPROPERTY(BlueprintReadOnly, Category = "Pose") FQuat UpperArm_R  = FQuat::Identity;
     UPROPERTY(BlueprintReadOnly, Category = "Pose") FQuat LowerArm_L  = FQuat::Identity;
     UPROPERTY(BlueprintReadOnly, Category = "Pose") FQuat LowerArm_R  = FQuat::Identity;
-
-    // ── 다리 ─────────────────────────────
     UPROPERTY(BlueprintReadOnly, Category = "Pose") FQuat UpperLeg_L  = FQuat::Identity;
     UPROPERTY(BlueprintReadOnly, Category = "Pose") FQuat UpperLeg_R  = FQuat::Identity;
     UPROPERTY(BlueprintReadOnly, Category = "Pose") FQuat LowerLeg_L  = FQuat::Identity;
     UPROPERTY(BlueprintReadOnly, Category = "Pose") FQuat LowerLeg_R  = FQuat::Identity;
-
-    // ── 발 ───────────────────────────────
     UPROPERTY(BlueprintReadOnly, Category = "Pose") FQuat Foot_L      = FQuat::Identity;
     UPROPERTY(BlueprintReadOnly, Category = "Pose") FQuat Foot_R      = FQuat::Identity;
-
-    UPROPERTY(BlueprintReadOnly, Category = "Pose") bool bHasData     = false;
+    UPROPERTY(BlueprintReadOnly, Category = "Pose") bool  bHasData    = false;
 };
 
 // ──────────────────────────────────────────
-//  OSC 수신 + 전신 쿼터니언 계산 Actor
+//  OSC 수신 + 전신 쿼터니언 계산 Actor (다인원 지원)
 // ──────────────────────────────────────────
 UCLASS(BlueprintType, Blueprintable)
 class POSERETARGETING_API AOSCPoseReceiver : public AActor
@@ -76,31 +76,37 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OSC")
     int32 ListenPort = 9000;
 
-    // ── 전신 관절 데이터 (TMap, 27개) ─────
+    // ── 다인원 설정 ───────────────────────
+    /** Python MAX_PERSONS 와 동일하게 설정 (1~3) */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Pose|MultiPerson",
+              meta = (ClampMin = "1", ClampMax = "3"))
+    int32 MaxPersons = 3;
+
+    // ── 전신 관절 데이터 (PersonId → 관절이름 → 위치) ──────
     /**
-     * 키: Python 에서 송신하는 관절 이름
-     *   머리: Nose, L_Eye, R_Eye, L_Ear, R_Ear
-     *   상체: L_Shoulder, R_Shoulder, L_Elbow, R_Elbow, L_Wrist, R_Wrist
-     *   손:   L_Thumb, R_Thumb, L_Index, R_Index, L_Pinky, R_Pinky
-     *   하체: L_Hip, R_Hip, L_Knee, R_Knee, L_Ankle, R_Ankle
-     *   발:   L_Heel, R_Heel, L_Foot, R_Foot
+     * PersonJoints[0] = 첫 번째 사람의 27개 관절
+     * PersonJoints[1] = 두 번째 사람의 27개 관절
+     * ...
      */
     UPROPERTY(BlueprintReadOnly, Category = "Pose|Joints")
-    TMap<FString, FJointData> Joints;
+    TArray<FPersonJointMap> PersonJoints;
+
+    // ── 전신 쿼터니언 결과 (PersonId 인덱스) ─────────────
+    UPROPERTY(BlueprintReadOnly, Category = "Pose")
+    TArray<FPoseBoneResult> PersonBoneResults;
 
     // ── 바인드 포즈 기준 방향 (UE5 Manny T-포즈 기준) ──
-    // 캐릭터가 +X를 향할 때 컴포넌트 공간 방향
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Pose|BindPose")
-    FVector BindDir_Neck       = FVector(0.f,  0.f,  1.f);  // 위(+Z)
+    FVector BindDir_Neck       = FVector(0.f,  0.f,  1.f);
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Pose|BindPose")
-    FVector BindDir_Spine      = FVector(0.f,  0.f,  1.f);  // 위(+Z)
+    FVector BindDir_Spine      = FVector(0.f,  0.f,  1.f);
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Pose|BindPose")
-    FVector BindDir_UpperArm_L = FVector(0.f, -1.f,  0.f);  // 좌(-Y)
+    FVector BindDir_UpperArm_L = FVector(0.f, -1.f,  0.f);
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Pose|BindPose")
-    FVector BindDir_UpperArm_R = FVector(0.f,  1.f,  0.f);  // 우(+Y)
+    FVector BindDir_UpperArm_R = FVector(0.f,  1.f,  0.f);
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Pose|BindPose")
     FVector BindDir_LowerArm_L = FVector(0.f, -1.f,  0.f);
@@ -109,7 +115,7 @@ public:
     FVector BindDir_LowerArm_R = FVector(0.f,  1.f,  0.f);
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Pose|BindPose")
-    FVector BindDir_UpperLeg_L = FVector(0.f,  0.f, -1.f);  // 아래(-Z)
+    FVector BindDir_UpperLeg_L = FVector(0.f,  0.f, -1.f);
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Pose|BindPose")
     FVector BindDir_UpperLeg_R = FVector(0.f,  0.f, -1.f);
@@ -121,14 +127,10 @@ public:
     FVector BindDir_LowerLeg_R = FVector(0.f,  0.f, -1.f);
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Pose|BindPose")
-    FVector BindDir_Foot_L     = FVector(1.f,  0.f,  0.f);  // 전방(+X)
+    FVector BindDir_Foot_L     = FVector(1.f,  0.f,  0.f);
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Pose|BindPose")
     FVector BindDir_Foot_R     = FVector(1.f,  0.f,  0.f);
-
-    // ── 계산 결과 ─────────────────────────
-    UPROPERTY(BlueprintReadOnly, Category = "Pose")
-    FPoseBoneResult BoneResult;
 
     // ── 디버그 ────────────────────────────
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Pose|Debug")
@@ -144,21 +146,29 @@ public:
     int32 TotalMessagesReceived = 0;
 
     // ── Blueprint 유틸리티 ────────────────
-    /** RealSense 카메라 좌표 → Unreal 좌표 변환 */
     UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Pose")
     static FVector ConvertCamToUnreal(float RS_X, float RS_Y, float RS_Z);
 
-    /**
-     * 두 관절 벡터 → 뼈대 쿼터니언
-     * Q = FindBetweenVectors(BindDir, normalize(ToPos - FromPos))
-     */
     UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Pose")
     static FQuat ComputeBoneQuat(const FVector& FromPos, const FVector& ToPos,
                                  const FVector& BindDir);
 
-    /** 관절 위치 조회 (Blueprint 에서 사용) */
+    /** 특정 사람의 관절 위치 조회 */
     UFUNCTION(BlueprintCallable, Category = "Pose")
-    bool GetJoint(const FString& Name, FVector& OutPosition, bool& OutValid) const;
+    bool GetJointForPerson(int32 PersonId, const FString& Name,
+                           FVector& OutPosition, bool& OutValid) const;
+
+    /** 현재 수신 중인 사람 수 */
+    UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Pose")
+    int32 GetActivePersonCount() const;
+
+    /** 특정 사람의 관절 맵 직접 접근 헬퍼 */
+    const TMap<FString, FJointData>* GetJointsMapForPerson(int32 PersonId) const
+    {
+        if (PersonJoints.IsValidIndex(PersonId))
+            return &PersonJoints[PersonId].Joints;
+        return nullptr;
+    }
 
 protected:
     virtual void BeginPlay() override;
@@ -170,7 +180,8 @@ private:
     UOSCServer* OSCServer = nullptr;
 
     FCriticalSection JointMutex;
-    TMap<FString, FJointData> PendingJoints;
+    // 버퍼: OSC 스레드 → 게임 스레드
+    TArray<TMap<FString, FJointData>> PendingPersonJoints;
     TAtomic<int32> MessageCounter{ 0 };
 
     UFUNCTION()
@@ -178,18 +189,19 @@ private:
                           const FString& IPAddress, int32 Port);
 
     void FlushAndComputeRotations();
-    void StoreJoint(const FString& Name,
-                    float RS_X, float RS_Y, float RS_Z, float DepthM);
+    void ComputeBonesForPerson(int32 PersonId);
     void DrawDebugVisualization();
 
-    /** TMap 에서 관절을 안전하게 가져오는 내부 헬퍼 */
-    const FJointData* FindJoint(const FString& Name) const;
+    /** 특정 사람의 TMap 에서 관절을 안전하게 가져오는 헬퍼 */
+    static const FJointData* FindJointInMap(
+        const TMap<FString, FJointData>& JointsMap, const FString& Name);
 
-    /** 두 관절이 모두 유효할 때만 쿼터니언 계산 후 저장 */
-    void TryComputeBone(FQuat& OutQuat,
-                        const FString& FromName, const FString& ToName,
-                        const FVector& BindDir);
+    /** 특정 사람의 TMap 에서 두 관절이 유효하면 쿼터니언 계산 */
+    void TryComputeBoneInMap(FQuat& OutQuat,
+                             const TMap<FString, FJointData>& JointsMap,
+                             const FString& FromName, const FString& ToName,
+                             const FVector& BindDir);
 
-    /** 두 관절의 중간점 계산 (척추·골반 중심 등에 사용) */
+    /** 두 관절의 중간점 계산 */
     static bool MidPoint(const FJointData* A, const FJointData* B, FVector& OutMid);
 };
