@@ -1,9 +1,11 @@
 # RealSense Retargeting
 
 Intel RealSense D455 카메라로 인체 관절 3D 좌표를 실시간 추출하고, OSC 프로토콜로 Unreal Engine 5 아바타에 리타게팅하는 프로젝트입니다.
+**최대 3명 동시 추적**을 지원합니다.
 
 ```
-D455 카메라 → MediaPipe Pose → 3D 좌표 (칼만 필터) → OSC UDP → UE5 아바타 뼈대 제어
+D455 카메라 → MediaPipe Pose (최대 3명) → 3D 좌표 (칼만 필터)
+    → OSC UDP /pose/<person_id>/<joint> → UE5 아바타 뼈대 제어
 ```
 
 ---
@@ -12,7 +14,8 @@ D455 카메라 → MediaPipe Pose → 3D 좌표 (칼만 필터) → OSC UDP → 
 
 ```
 realsenseRetargeting/
-├── d455_pose3d_osc.py          # 메인: 포즈 추출 + OSC 송신
+├── d455_pose3d_osc.py          # 메인: 다인원 포즈 추출 + OSC 송신
+├── create_launcher.py          # run_d455.bat 런처 파일 생성기
 ├── d455_pose3d.py              # 기본: 포즈 3D 시각화 (OSC 없음)
 ├── d455_viewer.py              # 카메라 뷰어 (컬러 + 깊이)
 ├── d455_triple_view.py         # 3분할 뷰 (컬러 / 깊이 / IR)
@@ -26,7 +29,7 @@ realsenseRetargeting/
     ├── PoseRetargeting.uproject
     ├── Config/
     └── Source/PoseRetargeting/
-        ├── OSCPoseReceiver.h/.cpp          # OSC 서버 + 쿼터니언 계산
+        ├── OSCPoseReceiver.h/.cpp          # OSC 서버 + 다인원 쿼터니언 계산
         ├── PoseRetargetingAnimInstance.h/.cpp  # SLERP 스무딩 + Anim Graph
         └── PoseRetargeting.Build.cs
 ```
@@ -86,6 +89,18 @@ c:\0.shinhyoung\Project\realsenseTest\pose_landmarker_lite.task
 
 ### Python (포즈 추출 + OSC 송신)
 
+#### 방법 1 — 런처 파일 사용 (권장)
+
+```bash
+# 최초 1회 런처 파일 생성
+python create_launcher.py
+
+# 이후부터는 생성된 배치파일 더블클릭
+C:\Users\<사용자명>\run_d455.bat
+```
+
+#### 방법 2 — 직접 실행
+
 ```bash
 conda activate d455_env
 python d455_pose3d_osc.py
@@ -98,12 +113,21 @@ python d455_pose3d_osc.py
 | `K` | 칼만 필터 ON / OFF 토글 |
 | `Q` | 종료 |
 
+**화면 표시**
+
+| 색상 | 사람 |
+|------|------|
+| 노란색 | 0번 사람 |
+| 초록색 | 1번 사람 |
+| 파란색 | 2번 사람 |
+
 ### Unreal Engine (OSC 수신 + 아바타 제어)
 
 1. `UnrealProject/PoseRetargeting.uproject` 더블클릭
-2. 레벨에 `OSCPoseReceiver` 액터 배치
+2. 레벨에 `OSCPoseReceiver` 액터 배치 (MaxPersons: 3)
 3. AnimBP를 `PoseRetargetingAnimInstance` 기반으로 생성
-4. Play → Python 실행 시 아바타에 포즈 적용
+4. 아바타마다 `PersonIndex` 설정 (0 / 1 / 2)
+5. Play → Python 실행 시 각 아바타에 해당 사람 포즈 적용
 
 ---
 
@@ -114,8 +138,14 @@ python d455_pose3d_osc.py
 | 프로토콜 | UDP |
 | 송신 IP | 127.0.0.1 |
 | 포트 | 9000 |
-| 메시지 주소 | `/pose/<joint_name>` |
+| 메시지 주소 | `/pose/<person_id>/<joint_name>` |
 | 인수 | `float x, float y, float z` (단위: m, 카메라 기준) |
+
+**예시**
+```
+/pose/0/L_Shoulder  →  첫 번째 사람 왼쪽 어깨
+/pose/1/R_Wrist     →  두 번째 사람 오른쪽 손목
+```
 
 ### 전송 관절 목록 (27개)
 
@@ -144,30 +174,40 @@ RealSense (m)          →    Unreal Engine (cm)
 
 ```
 OSCPoseReceiver (Actor)
-  └─ OSC 수신 → 27개 관절 위치 저장
-  └─ 12개 뼈 쿼터니언 계산 (FQuat::FindBetweenVectors)
+  ├─ MaxPersons = 3
+  ├─ PersonJoints[0..2]      → 사람별 27개 관절 위치 (cm)
+  └─ PersonBoneResults[0..2] → 사람별 12개 뼈 쿼터니언
        Neck / Spine / UpperArm L,R / LowerArm L,R
        UpperLeg L,R / LowerLeg L,R / Foot L,R
 
 PoseRetargetingAnimInstance (AnimBP)
+  ├─ PersonIndex = 0 | 1 | 2   (어느 사람을 추적할지)
   └─ SLERP 스무딩 → FRotator 변환 → Anim Graph 공급
 ```
+
+**다인원 아바타 설정**
+- 아바타 3개를 레벨에 배치
+- 각 AnimBP의 `PersonIndex`를 0, 1, 2 로 설정
+- 각 아바타가 서로 다른 사람의 포즈를 독립적으로 추적
 
 ---
 
 ## 칼만 필터
 
-깊이 카메라 노이즈와 MediaPipe 랜드마크 지터를 제거하기 위해 각 관절의 XYZ 축에 독립적으로 1D 칼만 필터를 적용합니다.
+깊이 카메라 노이즈와 MediaPipe 랜드마크 지터를 제거하기 위해
+각 관절의 XYZ 축에 독립적으로 1D 칼만 필터를 적용합니다.
+사람별로 별도의 필터 세트를 유지합니다.
 
 ```python
 KALMAN_Q = 0.001   # 프로세스 노이즈 (클수록 빠른 추적)
 KALMAN_R = 0.02    # 측정 노이즈   (클수록 강한 스무딩)
 ```
 
+`K` 키로 실시간 ON/OFF 전환 가능
+
 ---
 
 ## 하드웨어 요구사항
 
-- Intel RealSense D455 카메라
-- USB 3.0 포트
+- Intel RealSense D455 카메라 (USB 3.0 포트 연결)
 - NVIDIA GPU (MediaPipe 가속, 선택사항)
