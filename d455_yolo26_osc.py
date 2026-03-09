@@ -1,38 +1,25 @@
 """
-d455_pose3d_osc.py
-RealSense D455 + MediaPipe Pose → 전신 관절 OSC 송신 (다인원 지원)
+d455_yolo26_osc.py
+RealSense D455 + YOLO26 Pose → 전신 관절 OSC 송신 (다인원 지원, ID 추적)
+
+YOLO26 Pose는 COCO 17 키포인트를 검출합니다:
+  Nose, L_Eye, R_Eye, L_Ear, R_Ear,
+  L_Shoulder, R_Shoulder, L_Elbow, R_Elbow, L_Wrist, R_Wrist,
+  L_Hip, R_Hip, L_Knee, R_Knee, L_Ankle, R_Ankle
 
 OSC 메시지 형식:
-  주소: /pose/<person_id>/<joint_name>
+  주소: /pose/<track_id>/<joint_name>
   인수: float x, float y, float z  (단위: m, 카메라 기준 좌표)
 
-  예시:
-    /pose/0/L_Shoulder  → 첫 번째 사람 왼쪽 어깨
-    /pose/1/R_Wrist     → 두 번째 사람 오른쪽 손목
-
-  전신 관절 목록 (27개):
-    머리:  Nose, L_Eye, R_Eye, L_Ear, R_Ear
-    상체:  L_Shoulder, R_Shoulder, L_Elbow, R_Elbow, L_Wrist, R_Wrist
-    손:    L_Thumb, R_Thumb, L_Index, R_Index, L_Pinky, R_Pinky
-    하체:  L_Hip, R_Hip, L_Knee, R_Knee, L_Ankle, R_Ankle
-    발:    L_Heel, R_Heel, L_Foot, R_Foot
-
 필요 패키지:
-  pip install python-osc
+  pip install ultralytics python-osc pyrealsense2 opencv-python numpy
 """
 
+import torch
 import pyrealsense2 as rs
 import numpy as np
 import cv2
-import mediapipe as mp
-from mediapipe.tasks.python import BaseOptions
-from mediapipe.tasks.python.vision import (
-    PoseLandmarker,
-    PoseLandmarkerOptions,
-    PoseLandmark,
-    PoseLandmarksConnections,
-    RunningMode,
-)
+from ultralytics import YOLO
 from pythonosc.udp_client import SimpleUDPClient
 from pythonosc.osc_bundle_builder import OscBundleBuilder
 from pythonosc.osc_message_builder import OscMessageBuilder
@@ -79,15 +66,58 @@ class JointKalmanFilter:
 
 
 # ══════════════════════════════════════════
-#  다인원 설정
+#  YOLO26 Pose 설정
 # ══════════════════════════════════════════
-MAX_PERSONS = 3   # 최대 검출 인원 (1~3)
+YOLO_MODELS = {
+    "n": "yolo26n-pose.pt",   # Nano:   빠름, 정확도 보통
+    "m": "yolo26m-pose.pt",   # Medium: 느림, 정확도 높음
+}
+current_model_key = "n"          # 시작 모델
+CONF_THRESHOLD = 0.5             # 검출 신뢰도 임계값
 
-# 사람별 화면 표시 색상 (BGR)
+# COCO 17 키포인트 이름 매핑
+KEYPOINT_NAMES = [
+    "Nose",
+    "L_Eye",    "R_Eye",
+    "L_Ear",    "R_Ear",
+    "L_Shoulder", "R_Shoulder",
+    "L_Elbow",  "R_Elbow",
+    "L_Wrist",  "R_Wrist",
+    "L_Hip",    "R_Hip",
+    "L_Knee",   "R_Knee",
+    "L_Ankle",  "R_Ankle",
+]
+
+# 화면에 좌표를 표시할 주요 관절
+DISPLAY_JOINTS = {
+    "Nose",
+    "L_Shoulder", "R_Shoulder",
+    "L_Wrist",    "R_Wrist",
+    "L_Hip",      "R_Hip",
+    "L_Ankle",    "R_Ankle",
+}
+
+# 스켈레톤 연결선 (COCO 17 키포인트 인덱스 쌍)
+SKELETON = [
+    (0, 1), (0, 2),     # Nose → Eyes
+    (1, 3), (2, 4),     # Eyes → Ears
+    (5, 6),             # L_Shoulder → R_Shoulder
+    (5, 7), (7, 9),     # L_Shoulder → L_Elbow → L_Wrist
+    (6, 8), (8, 10),    # R_Shoulder → R_Elbow → R_Wrist
+    (5, 11), (6, 12),   # Shoulders → Hips
+    (11, 12),           # L_Hip → R_Hip
+    (11, 13), (13, 15), # L_Hip → L_Knee → L_Ankle
+    (12, 14), (14, 16), # R_Hip → R_Knee → R_Ankle
+]
+
+# 사람별 화면 표시 색상 (BGR) — 트래킹 ID 기반
 PERSON_COLORS = [
-    (0,   255, 255),   # 0번: 노란색
-    (0,   255,   0),   # 1번: 초록
-    (255, 100,   0),   # 2번: 파랑
+    (0,   255, 255),   # 노란색
+    (0,   255,   0),   # 초록
+    (255, 100,   0),   # 파랑
+    (255,   0, 255),   # 마젠타
+    (0,   165, 255),   # 주황
+    (255, 255,   0),   # 시안
 ]
 
 # ══════════════════════════════════════════
@@ -97,68 +127,41 @@ OSC_IP   = "127.0.0.1"
 OSC_PORT = 9000
 
 osc_client = SimpleUDPClient(OSC_IP, OSC_PORT)
-print(f"[OSC] 송신 대상: {OSC_IP}:{OSC_PORT}  (최대 {MAX_PERSONS}명)")
 
 # ══════════════════════════════════════════
-#  모델 경로
+#  GPU / CPU 설정
 # ══════════════════════════════════════════
-MODEL_PATH = r"c:\0.shinhyoung\Project\realsenseTest\pose_landmarker_lite.task"
+gpu_available = torch.cuda.is_available()
+gpu_name = torch.cuda.get_device_name(0) if gpu_available else "N/A"
+use_gpu = gpu_available   # GPU 있으면 기본 GPU 사용
+current_device = "cuda" if use_gpu else "cpu"
+
+print(f"[GPU] {'사용 가능: ' + gpu_name if gpu_available else '사용 불가 — CPU 모드'}")
 
 # ══════════════════════════════════════════
-#  전신 관절 정의 (27개)
+#  YOLO26 모델 로드
 # ══════════════════════════════════════════
-LANDMARKS = {
-    "Nose":       PoseLandmark.NOSE,
-    "L_Eye":      PoseLandmark.LEFT_EYE,
-    "R_Eye":      PoseLandmark.RIGHT_EYE,
-    "L_Ear":      PoseLandmark.LEFT_EAR,
-    "R_Ear":      PoseLandmark.RIGHT_EAR,
-    "L_Shoulder": PoseLandmark.LEFT_SHOULDER,
-    "R_Shoulder": PoseLandmark.RIGHT_SHOULDER,
-    "L_Elbow":    PoseLandmark.LEFT_ELBOW,
-    "R_Elbow":    PoseLandmark.RIGHT_ELBOW,
-    "L_Wrist":    PoseLandmark.LEFT_WRIST,
-    "R_Wrist":    PoseLandmark.RIGHT_WRIST,
-    "L_Thumb":    PoseLandmark.LEFT_THUMB,
-    "R_Thumb":    PoseLandmark.RIGHT_THUMB,
-    "L_Index":    PoseLandmark.LEFT_INDEX,
-    "R_Index":    PoseLandmark.RIGHT_INDEX,
-    "L_Pinky":    PoseLandmark.LEFT_PINKY,
-    "R_Pinky":    PoseLandmark.RIGHT_PINKY,
-    "L_Hip":      PoseLandmark.LEFT_HIP,
-    "R_Hip":      PoseLandmark.RIGHT_HIP,
-    "L_Knee":     PoseLandmark.LEFT_KNEE,
-    "R_Knee":     PoseLandmark.RIGHT_KNEE,
-    "L_Ankle":    PoseLandmark.LEFT_ANKLE,
-    "R_Ankle":    PoseLandmark.RIGHT_ANKLE,
-    "L_Heel":     PoseLandmark.LEFT_HEEL,
-    "R_Heel":     PoseLandmark.RIGHT_HEEL,
-    "L_Foot":     PoseLandmark.LEFT_FOOT_INDEX,
-    "R_Foot":     PoseLandmark.RIGHT_FOOT_INDEX,
-}
+# 모델 캐시: {(model_key, device): YOLO}
+loaded_models: dict[tuple, YOLO] = {}
 
-# 화면에 좌표를 표시할 주요 관절
-DISPLAY_JOINTS = [
-    "Nose",
-    "L_Shoulder", "R_Shoulder",
-    "L_Wrist",    "R_Wrist",
-    "L_Hip",      "R_Hip",
-    "L_Ankle",    "R_Ankle",
-]
 
-CONNECTIONS = list(PoseLandmarksConnections.POSE_LANDMARKS)
+def load_model(key: str, device: str = None) -> YOLO:
+    """모델을 로드하고 지정 디바이스로 이동, 캐시 저장"""
+    if device is None:
+        device = current_device
+    cache_key = (key, device)
+    if cache_key not in loaded_models:
+        name = YOLO_MODELS[key]
+        print(f"[YOLO26] 모델 로딩: {name} → {device.upper()} ...")
+        m = YOLO(name)
+        m.to(device)
+        loaded_models[cache_key] = m
+        print(f"[YOLO26] {name} ({device.upper()}) 로드 완료")
+    return loaded_models[cache_key]
 
-# ══════════════════════════════════════════
-#  MediaPipe PoseLandmarker 초기화
-# ══════════════════════════════════════════
-options = PoseLandmarkerOptions(
-    base_options=BaseOptions(model_asset_path=MODEL_PATH),
-    running_mode=RunningMode.VIDEO,
-    num_poses=MAX_PERSONS,           # ← 다인원 검출
-    min_pose_detection_confidence=0.5,
-    min_tracking_confidence=0.5,
-)
-landmarker = PoseLandmarker.create_from_options(options)
+
+model = load_model(current_model_key, current_device)
+print(f"[OSC] 송신 대상: {OSC_IP}:{OSC_PORT}")
 
 # ══════════════════════════════════════════
 #  RealSense 파이프라인 설정
@@ -177,23 +180,21 @@ color_intrinsics = (
     .get_intrinsics()
 )
 
-frame_timestamp_ms = 0
-
-# 사람별 칼만 필터: {person_id: {joint_name: JointKalmanFilter}}
+# 칼만 필터: {track_id: {joint_name: JointKalmanFilter}}
 kalman_filters: dict[int, dict[str, JointKalmanFilter]] = {}
-# 사람별 2D 표시용 칼만 필터: {person_id: {landmark_index: (KF_x, KF_y)}}
+# 2D 표시용 칼만 필터: {track_id: {kp_index: (KF_x, KF_y)}}
 kalman_filters_2d: dict[int, dict[int, tuple]] = {}
-kalman_enabled = True   # 'k' 키로 ON/OFF
+kalman_enabled = True
 
 
 # ══════════════════════════════════════════
-#  OSC Bundle 송신  /pose/<person_id>/<joint_name>
+#  OSC Bundle 송신  /pose/<track_id>/<joint_name>
 # ══════════════════════════════════════════
-def send_osc_bundle(person_id: int, joint_data: dict):
+def send_osc_bundle(track_id: int, joint_data: dict):
     """한 사람의 관절을 OSC Bundle로 묶어 UDP 송신"""
     builder = OscBundleBuilder(osc_bundle_builder.IMMEDIATELY)
     for name, (x, y, z) in joint_data.items():
-        msg = OscMessageBuilder(address=f"/pose/{person_id}/{name}")
+        msg = OscMessageBuilder(address=f"/pose/{track_id}/{name}")
         msg.add_arg(float(x))
         msg.add_arg(float(y))
         msg.add_arg(float(z))
@@ -205,6 +206,8 @@ def send_osc_bundle(person_id: int, joint_data: dict):
 # ══════════════════════════════════════════
 #  메인 루프
 # ══════════════════════════════════════════
+print("[시작] 'q' 종료 | 'k' 칼만 ON/OFF | 'n' Nano | 'm' Medium | 'g' GPU/CPU")
+
 try:
     while True:
         frames  = pipeline.wait_for_frames()
@@ -219,11 +222,13 @@ try:
         depth_image = np.asanyarray(depth_frame.get_data())
         h, w = color_image.shape[:2]
 
-        # ── MediaPipe 추론 ──
-        rgb      = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        frame_timestamp_ms += 33
-        results = landmarker.detect_for_video(mp_image, frame_timestamp_ms)
+        # ── YOLO26 추론 + 트래킹 ──
+        results = model.track(
+            color_image,
+            persist=True,
+            conf=CONF_THRESHOLD,
+            verbose=False,
+        )
 
         # ── 깊이 JET 컬러맵 ──
         depth_colormap = cv2.applyColorMap(
@@ -232,53 +237,65 @@ try:
         )
 
         detected_count = 0
+        result = results[0]
 
-        if results.pose_landmarks:
-            detected_count = len(results.pose_landmarks)
+        if result.keypoints is not None and len(result.keypoints) > 0:
+            keypoints_data = result.keypoints.data  # (N, 17, 3) — x, y, conf
+            # 트래킹 ID 가져오기
+            if result.boxes.id is not None:
+                track_ids = result.boxes.id.int().cpu().tolist()
+            else:
+                track_ids = list(range(len(keypoints_data)))
 
-            for person_id, landmarks in enumerate(results.pose_landmarks):
-                color = PERSON_COLORS[person_id % len(PERSON_COLORS)]
+            detected_count = len(keypoints_data)
 
-                # 이 사람의 칼만 필터 초기화
-                if person_id not in kalman_filters:
-                    kalman_filters[person_id] = {}
-                if person_id not in kalman_filters_2d:
-                    kalman_filters_2d[person_id] = {}
+            for person_idx, (kps, track_id) in enumerate(
+                zip(keypoints_data, track_ids)
+            ):
+                color = PERSON_COLORS[track_id % len(PERSON_COLORS)]
+                kps_np = kps.cpu().numpy()  # (17, 3)
+
+                # 칼만 필터 딕셔너리 초기화
+                if track_id not in kalman_filters:
+                    kalman_filters[track_id] = {}
+                if track_id not in kalman_filters_2d:
+                    kalman_filters_2d[track_id] = {}
 
                 # ── 2D 픽셀 좌표 칼만 필터 적용 ──
                 filtered_px = []
-                kf2d = kalman_filters_2d[person_id]
-                for idx, lm in enumerate(landmarks):
-                    raw_x, raw_y = lm.x * w, lm.y * h
-                    if kalman_enabled:
+                kf2d = kalman_filters_2d[track_id]
+                for idx in range(17):
+                    raw_x, raw_y, conf = kps_np[idx]
+                    if kalman_enabled and conf > 0.3:
                         if idx not in kf2d:
                             kf2d[idx] = (_KF1D(KALMAN_Q, KALMAN_R),
                                          _KF1D(KALMAN_Q, KALMAN_R))
                         fx, fy = kf2d[idx]
                         raw_x = fx.update(raw_x)
                         raw_y = fy.update(raw_y)
-                    filtered_px.append((int(raw_x), int(raw_y)))
+                    filtered_px.append((int(raw_x), int(raw_y), conf))
 
                 # ── 스켈레톤 연결선 ──
-                for conn in CONNECTIONS:
-                    cv2.line(color_image,
-                             filtered_px[conn.start],
-                             filtered_px[conn.end],
-                             color, 1)
+                for (i, j) in SKELETON:
+                    if filtered_px[i][2] > 0.3 and filtered_px[j][2] > 0.3:
+                        pt1 = (filtered_px[i][0], filtered_px[i][1])
+                        pt2 = (filtered_px[j][0], filtered_px[j][1])
+                        cv2.line(color_image, pt1, pt2, color, 2)
 
                 # ── 랜드마크 점 ──
-                for pt in filtered_px:
-                    cv2.circle(color_image, pt, 3, color, -1)
+                for idx, (px, py, conf) in enumerate(filtered_px):
+                    if conf > 0.3:
+                        cv2.circle(color_image, (px, py), 4, color, -1)
 
                 # ── 전신 3D 좌표 계산 + OSC 송신 ──
                 joint_data = {}
-                # 이 사람 박스 상단에 좌표 표시할 y 위치 계산
-                min_y = int(min(lm.y for lm in landmarks) * h)
-                y_offset = max(18, min_y)
+                y_offset = 25 + person_idx * 170
 
-                for name, lm_id in LANDMARKS.items():
-                    lm = landmarks[lm_id.value]
-                    px, py = filtered_px[lm_id.value]
+                for idx, name in enumerate(KEYPOINT_NAMES):
+                    px, py, conf = filtered_px[idx]
+                    if conf < 0.3:
+                        continue
+
                     px_c = max(0, min(px, w - 1))
                     py_c = max(0, min(py, h - 1))
 
@@ -290,7 +307,7 @@ try:
 
                     if depth_val > 0.0:
                         if kalman_enabled:
-                            kf = kalman_filters[person_id]
+                            kf = kalman_filters[track_id]
                             if name not in kf:
                                 kf[name] = JointKalmanFilter()
                             x3, y3, z3 = kf[name].update(x3, y3, z3)
@@ -299,13 +316,12 @@ try:
                     # 주요 관절 화면 표시
                     if name in DISPLAY_JOINTS:
                         cv2.circle(color_image, (px, py), 6, color, -1)
-                        # 사람 ID 포함 텍스트
                         if name == "Nose":
                             cv2.putText(color_image,
-                                        f"P{person_id}",
+                                        f"ID:{track_id}",
                                         (px + 8, py),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-                        text = f"P{person_id} {name}:({x3:+.2f},{z3:.2f}m)"
+                        text = f"ID:{track_id} {name}:({x3:+.2f},{z3:.2f}m)"
                         cv2.putText(color_image, text, (10, y_offset),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
                         y_offset += 15
@@ -313,19 +329,21 @@ try:
                 # ── OSC 송신 ──
                 if joint_data:
                     try:
-                        send_osc_bundle(person_id, joint_data)
+                        send_osc_bundle(track_id, joint_data)
                     except Exception as e:
-                        print(f"[OSC] P{person_id} 송신 오류: {e}")
+                        print(f"[OSC] ID:{track_id} 송신 오류: {e}")
 
         else:
             cv2.putText(color_image, "No Pose Detected", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
         # ── 상태 표시 (하단) ──
+        model_label = YOLO_MODELS[current_model_key]
+        device_label = current_device.upper()
         cv2.putText(color_image,
-                    f"OSC -> {OSC_IP}:{OSC_PORT}  Persons:{detected_count}/{MAX_PERSONS}",
+                    f"{model_label} ({device_label}) | OSC -> {OSC_IP}:{OSC_PORT}  Persons:{detected_count}  [N]ano [M]edium [G]PU/CPU",
                     (10, h - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 200, 0), 1)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.33, (255, 200, 0), 1)
 
         # ── 칼만 필터 상태 (우상단) ──
         kalman_label = "Kalman: ON  [K]" if kalman_enabled else "Kalman: OFF [K]"
@@ -334,9 +352,15 @@ try:
                     (w - 175, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, kalman_color, 2)
 
+        # ── 디바이스 상태 (우상단 2번째 줄) ──
+        dev_color = (0, 255, 100) if current_device == "cuda" else (0, 80, 255)
+        cv2.putText(color_image, f"Device: {device_label} [G]",
+                    (w - 175, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, dev_color, 1)
+
         # ── 화면 표시 ──
         display = np.hstack((color_image, depth_colormap))
-        cv2.imshow("D455 Multi-Person OSC | 'q' quit  'k' kalman", display)
+        cv2.imshow("D455 YOLO26 Pose OSC | 'q' quit  'k' kalman", display)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
@@ -347,9 +371,26 @@ try:
                 kalman_filters.clear()
                 kalman_filters_2d.clear()
             print(f"[Kalman] {'ON' if kalman_enabled else 'OFF'}")
+        elif key == ord("n") and current_model_key != "n":
+            current_model_key = "n"
+            model = load_model("n", current_device)
+            kalman_filters.clear()
+            kalman_filters_2d.clear()
+            print(f"[YOLO26] Nano 모델로 전환 ({current_device.upper()})")
+        elif key == ord("m") and current_model_key != "m":
+            current_model_key = "m"
+            model = load_model("m", current_device)
+            kalman_filters.clear()
+            kalman_filters_2d.clear()
+            print(f"[YOLO26] Medium 모델로 전환 ({current_device.upper()})")
+        elif key == ord("g") and gpu_available:
+            current_device = "cpu" if current_device == "cuda" else "cuda"
+            model = load_model(current_model_key, current_device)
+            kalman_filters.clear()
+            kalman_filters_2d.clear()
+            print(f"[Device] {current_device.upper()} 로 전환")
 
 finally:
-    landmarker.close()
     pipeline.stop()
     cv2.destroyAllWindows()
     print("[완료] 프로그램 종료")

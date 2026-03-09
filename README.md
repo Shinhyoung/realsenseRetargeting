@@ -1,11 +1,11 @@
 # RealSense Retargeting
 
-Intel RealSense D455 카메라로 인체 관절 3D 좌표를 실시간 추출하고, OSC 프로토콜로 Unreal Engine 5 아바타에 리타게팅하는 프로젝트입니다.
-**최대 3명 동시 추적**을 지원합니다.
+Intel RealSense D455 카메라로 인체 관절 3D 좌표를 실시간 추출하고, OSC 프로토콜로 Unreal Engine 5 / Unity 등에 전송하는 프로젝트입니다.
+**다인원 동시 추적**을 지원하며, MediaPipe 와 YOLO26 Pose 두 가지 엔진을 제공합니다.
 
 ```
-D455 카메라 → MediaPipe Pose (최대 3명) → 3D 좌표 (칼만 필터)
-    → OSC UDP /pose/<person_id>/<joint> → UE5 아바타 뼈대 제어
+D455 카메라 → MediaPipe / YOLO26 Pose → 3D 좌표 (칼만 필터)
+    → OSC UDP /pose/<id>/<joint> → UE5 / Unity 아바타 제어
 ```
 
 ---
@@ -14,7 +14,10 @@ D455 카메라 → MediaPipe Pose (최대 3명) → 3D 좌표 (칼만 필터)
 
 ```
 realsenseRetargeting/
-├── d455_pose3d_osc.py          # 메인: 다인원 포즈 추출 + OSC 송신
+├── d455_pose3d_osc.py          # MediaPipe: 다인원 포즈 추출 + OSC 송신 (27관절)
+├── d455_yolo26_osc.py          # YOLO26:   다인원 포즈 추출 + OSC 송신 (17관절, GPU지원)
+├── d455_pose3d_osc_release.py  # Release 빌드용 (exe)
+├── build_release.py            # PyInstaller Release 빌드 스크립트
 ├── create_launcher.py          # run_d455.bat 런처 파일 생성기
 ├── d455_pose3d.py              # 기본: 포즈 3D 시각화 (OSC 없음)
 ├── d455_viewer.py              # 카메라 뷰어 (컬러 + 깊이)
@@ -25,6 +28,8 @@ realsenseRetargeting/
 ├── calibrate_color.py          # 컬러 카메라 캘리브레이션
 ├── calibrate_ir.py             # IR 카메라 캘리브레이션
 ├── generate_checkerboard.py    # 캘리브레이션용 체커보드 생성
+├── Release/                    # exe 빌드 결과물
+│   └── D455_PoseOSC/
 └── UnrealProject/              # UE5 C++ 프로젝트
     ├── PoseRetargeting.uproject
     ├── Config/
@@ -33,6 +38,20 @@ realsenseRetargeting/
         ├── PoseRetargetingAnimInstance.h/.cpp  # SLERP 스무딩 + Anim Graph
         └── PoseRetargeting.Build.cs
 ```
+
+---
+
+## MediaPipe vs YOLO26 비교
+
+| 항목 | d455_pose3d_osc.py (MediaPipe) | d455_yolo26_osc.py (YOLO26) |
+|------|-------------------------------|----------------------------|
+| 키포인트 | 27개 (손/발 포함) | 17개 (COCO 표준) |
+| 최대 인원 | 3명 (설정값) | 무제한 (자동 검출) |
+| ID 추적 | 인덱스 순서 (불안정) | ByteTrack (고유 ID 유지) |
+| 겹침 처리 | 약함 | 강함 |
+| GPU 지원 | 미지원 | CUDA GPU 지원 (G키 전환) |
+| 모델 전환 | 불가 | N/M 키로 Nano/Medium 실시간 전환 |
+| 외부 모델 | pose_landmarker_lite.task 필요 | 자동 다운로드 |
 
 ---
 
@@ -45,24 +64,34 @@ conda create -n d455_env python=3.10
 conda activate d455_env
 ```
 
-### 2. 패키지 설치
+### 2. 공통 패키지 설치
 
 ```bash
 pip install pyrealsense2
 pip install opencv-python
-pip install mediapipe
 pip install python-osc
 ```
 
-### 3. MediaPipe 모델 다운로드
+### 3-A. MediaPipe 버전 추가 패키지
 
-[pose_landmarker_lite.task](https://ai.google.dev/edge/mediapipe/solutions/vision/pose_landmarker) 를 다운로드하여 아래 경로에 저장:
-
-```
-c:\0.shinhyoung\Project\realsenseTest\pose_landmarker_lite.task
+```bash
+pip install mediapipe
 ```
 
-> 경로를 변경하려면 `d455_pose3d_osc.py` 의 `MODEL_PATH` 수정
+[pose_landmarker_lite.task](https://ai.google.dev/edge/mediapipe/solutions/vision/pose_landmarker) 다운로드 후 경로 설정 (`MODEL_PATH`)
+
+### 3-B. YOLO26 버전 추가 패키지
+
+```bash
+pip install ultralytics
+```
+
+### 4. GPU 사용 (YOLO26, 선택사항)
+
+```bash
+# CUDA 12.8 기준 (NVIDIA GPU 필요)
+pip install --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu128
+```
 
 ---
 
@@ -87,46 +116,49 @@ c:\0.shinhyoung\Project\realsenseTest\pose_landmarker_lite.task
 
 ## 실행 방법
 
-### Python (포즈 추출 + OSC 송신)
-
-#### 방법 1 — 런처 파일 사용 (권장)
-
-```bash
-# 최초 1회 런처 파일 생성
-python create_launcher.py
-
-# 이후부터는 생성된 배치파일 더블클릭
-C:\Users\<사용자명>\run_d455.bat
-```
-
-#### 방법 2 — 직접 실행
+### Python — MediaPipe 버전
 
 ```bash
 conda activate d455_env
 python d455_pose3d_osc.py
 ```
 
-**단축키**
+| 키 | 동작 |
+|----|------|
+| `K` | 칼만 필터 ON/OFF |
+| `Q` | 종료 |
+
+### Python — YOLO26 버전
+
+```bash
+conda activate d455_env
+python d455_yolo26_osc.py
+```
 
 | 키 | 동작 |
 |----|------|
-| `K` | 칼만 필터 ON / OFF 토글 |
+| `K` | 칼만 필터 ON/OFF |
+| `N` | Nano 모델 전환 (빠름) |
+| `M` | Medium 모델 전환 (정확) |
+| `G` | GPU / CPU 전환 |
 | `Q` | 종료 |
 
-**화면 표시**
+### Python — Release (exe)
 
-| 색상 | 사람 |
-|------|------|
-| 노란색 | 0번 사람 |
-| 초록색 | 1번 사람 |
-| 파란색 | 2번 사람 |
+```bash
+# 빌드
+python build_release.py
+
+# 실행 (conda 불필요)
+Release/D455_PoseOSC/D455_PoseOSC.exe
+```
 
 ### Unreal Engine (OSC 수신 + 아바타 제어)
 
 1. `UnrealProject/PoseRetargeting.uproject` 더블클릭
-2. 레벨에 `OSCPoseReceiver` 액터 배치 (MaxPersons: 3)
+2. 레벨에 `OSCPoseReceiver` 액터 배치
 3. AnimBP를 `PoseRetargetingAnimInstance` 기반으로 생성
-4. 아바타마다 `PersonIndex` 설정 (0 / 1 / 2)
+4. 아바타마다 `PersonIndex` 설정 (0 / 1 / 2 ...)
 5. Play → Python 실행 시 각 아바타에 해당 사람 포즈 적용
 
 ---
@@ -138,8 +170,10 @@ python d455_pose3d_osc.py
 | 프로토콜 | UDP |
 | 송신 IP | 127.0.0.1 |
 | 포트 | 9000 |
-| 메시지 주소 | `/pose/<person_id>/<joint_name>` |
+| 메시지 주소 | `/pose/<id>/<joint_name>` |
 | 인수 | `float x, float y, float z` (단위: m, 카메라 기준) |
+
+> OSC는 표준 프로토콜이므로 UE5, Unity, TouchDesigner, Max/MSP 등 어떤 수신측에서도 동일하게 사용 가능합니다.
 
 **예시**
 ```
@@ -147,7 +181,9 @@ python d455_pose3d_osc.py
 /pose/1/R_Wrist     →  두 번째 사람 오른쪽 손목
 ```
 
-### 전송 관절 목록 (27개)
+### 전송 관절 목록
+
+**MediaPipe (27개)**
 
 | 부위 | 관절 |
 |------|------|
@@ -156,6 +192,14 @@ python d455_pose3d_osc.py
 | 손 | L_Thumb, R_Thumb, L_Index, R_Index, L_Pinky, R_Pinky |
 | 하체 | L_Hip, R_Hip, L_Knee, R_Knee, L_Ankle, R_Ankle |
 | 발 | L_Heel, R_Heel, L_Foot, R_Foot |
+
+**YOLO26 (17개, COCO 표준)**
+
+| 부위 | 관절 |
+|------|------|
+| 머리 | Nose, L_Eye, R_Eye, L_Ear, R_Ear |
+| 상체 | L_Shoulder, R_Shoulder, L_Elbow, R_Elbow, L_Wrist, R_Wrist |
+| 하체 | L_Hip, R_Hip, L_Knee, R_Knee, L_Ankle, R_Ankle |
 
 ---
 
@@ -168,35 +212,20 @@ RealSense (m)          →    Unreal Engine (cm)
   Z = 깊이 (전방)          X = Z_RS × 100
 ```
 
----
-
-## UE5 아바타 제어 구조
-
 ```
-OSCPoseReceiver (Actor)
-  ├─ MaxPersons = 3
-  ├─ PersonJoints[0..2]      → 사람별 27개 관절 위치 (cm)
-  └─ PersonBoneResults[0..2] → 사람별 12개 뼈 쿼터니언
-       Neck / Spine / UpperArm L,R / LowerArm L,R
-       UpperLeg L,R / LowerLeg L,R / Foot L,R
-
-PoseRetargetingAnimInstance (AnimBP)
-  ├─ PersonIndex = 0 | 1 | 2   (어느 사람을 추적할지)
-  └─ SLERP 스무딩 → FRotator 변환 → Anim Graph 공급
+RealSense (m)          →    Unity (m)
+  X = 오른쪽               X =  X_RS
+  Y = 아래쪽               Y = -Y_RS
+  Z = 깊이 (전방)          Z =  Z_RS
 ```
-
-**다인원 아바타 설정**
-- 아바타 3개를 레벨에 배치
-- 각 AnimBP의 `PersonIndex`를 0, 1, 2 로 설정
-- 각 아바타가 서로 다른 사람의 포즈를 독립적으로 추적
 
 ---
 
 ## 칼만 필터
 
-깊이 카메라 노이즈와 MediaPipe 랜드마크 지터를 제거하기 위해
+깊이 카메라 노이즈와 랜드마크 지터를 제거하기 위해
 각 관절의 XYZ 축에 독립적으로 1D 칼만 필터를 적용합니다.
-사람별로 별도의 필터 세트를 유지합니다.
+사람별로 별도의 필터 세트를 유지하며, 2D 화면 표시와 3D OSC 전송 모두에 적용됩니다.
 
 ```python
 KALMAN_Q = 0.001   # 프로세스 노이즈 (클수록 빠른 추적)
@@ -209,5 +238,7 @@ KALMAN_R = 0.02    # 측정 노이즈   (클수록 강한 스무딩)
 
 ## 하드웨어 요구사항
 
-- Intel RealSense D455 카메라 (USB 3.0 포트 연결)
-- NVIDIA GPU (MediaPipe 가속, 선택사항)
+| 항목 | 필수/선택 | 설명 |
+|------|----------|------|
+| Intel RealSense D455 | 필수 | USB 3.0 포트 연결 |
+| NVIDIA GPU | 선택 | YOLO26 CUDA 가속 (RTX 계열 권장) |
