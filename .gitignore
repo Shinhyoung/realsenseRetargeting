@@ -25,6 +25,15 @@ UnrealProject/*.sln
 # Unreal 콘텐츠 바이너리 (uasset은 Git LFS 없이 부적합)
 UnrealProject/Content/
 
+# Release 빌드 (exe, DLL 등 용량 큼)
+Release/
+
+# YOLO 모델 파일 (자동 다운로드)
+*.pt
+
+# PyInstaller 빌드 임시 파일
+build_temp/
+
 # Python
 __pycache__/
 *.pyc
