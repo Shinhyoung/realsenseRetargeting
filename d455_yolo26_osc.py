@@ -15,6 +15,7 @@ OSC 메시지 형식:
   pip install ultralytics python-osc pyrealsense2 opencv-python numpy
 """
 
+import time
 import torch
 import pyrealsense2 as rs
 import numpy as np
@@ -28,8 +29,11 @@ import pythonosc.osc_bundle_builder as osc_bundle_builder
 # ══════════════════════════════════════════
 #  칼만 필터 (관절 좌표 지터 제거)
 # ══════════════════════════════════════════
-KALMAN_Q = 0.001   # 프로세스 노이즈 (클수록 빠른 움직임 추적↑)
+KALMAN_Q = 0.01    # 프로세스 노이즈 (클수록 빠른 움직임 추적↑)
 KALMAN_R = 0.02    # 측정 노이즈   (클수록 스무딩↑)
+KALMAN_Q_MIN = 0.001
+KALMAN_Q_MAX = 0.5
+KALMAN_Q_STEP = 2.0  # 배율 (×2 / ÷2)
 
 
 class _KF1D:
@@ -63,6 +67,24 @@ class JointKalmanFilter:
         return (self.fx.update(x),
                 self.fy.update(y),
                 self.fz.update(z))
+
+    def set_q(self, q: float):
+        self.fx.Q = q
+        self.fy.Q = q
+        self.fz.Q = q
+
+
+def update_all_kalman_q(new_q: float):
+    """모든 활성 칼만 필터의 Q 값을 일괄 업데이트"""
+    global KALMAN_Q
+    KALMAN_Q = new_q
+    for filters in kalman_filters.values():
+        for jkf in filters.values():
+            jkf.set_q(new_q)
+    for filters_2d in kalman_filters_2d.values():
+        for (fx, fy) in filters_2d.values():
+            fx.Q = new_q
+            fy.Q = new_q
 
 
 # ══════════════════════════════════════════
@@ -186,12 +208,32 @@ kalman_filters: dict[int, dict[str, JointKalmanFilter]] = {}
 kalman_filters_2d: dict[int, dict[int, tuple]] = {}
 kalman_enabled = True
 
+# ══════════════════════════════════════════
+#  장시간 구동 안정성: 사라진 ID 칼만 필터 정리
+# ══════════════════════════════════════════
+STALE_TIMEOUT = 5.0  # 초: 이 시간 동안 미검출이면 필터 삭제
+kalman_last_seen: dict[int, float] = {}  # {track_id: last_seen_time}
+
+
+def cleanup_stale_filters(current_ids: set):
+    """현재 프레임에 없는 track_id의 칼만 필터를 일정 시간 후 삭제"""
+    now = time.time()
+    for tid in current_ids:
+        kalman_last_seen[tid] = now
+    stale = [tid for tid, t in kalman_last_seen.items()
+             if now - t > STALE_TIMEOUT and tid not in current_ids]
+    for tid in stale:
+        kalman_filters.pop(tid, None)
+        kalman_filters_2d.pop(tid, None)
+        kalman_last_seen.pop(tid, None)
+
 
 # ══════════════════════════════════════════
 #  OSC Bundle 송신  /pose/<track_id>/<joint_name>
 # ══════════════════════════════════════════
 def send_osc_bundle(track_id: int, joint_data: dict):
     """한 사람의 관절을 OSC Bundle로 묶어 UDP 송신"""
+    global osc_client
     builder = OscBundleBuilder(osc_bundle_builder.IMMEDIATELY)
     for name, (x, y, z) in joint_data.items():
         msg = OscMessageBuilder(address=f"/pose/{track_id}/{name}")
@@ -200,17 +242,45 @@ def send_osc_bundle(track_id: int, joint_data: dict):
         msg.add_arg(float(z))
         builder.add_content(msg.build())
     bundle = builder.build()
-    osc_client._sock.sendto(bundle.dgram, (OSC_IP, OSC_PORT))
+    try:
+        osc_client._sock.sendto(bundle.dgram, (OSC_IP, OSC_PORT))
+    except OSError:
+        # 소켓 오류 시 재생성
+        osc_client = SimpleUDPClient(OSC_IP, OSC_PORT)
+        osc_client._sock.sendto(bundle.dgram, (OSC_IP, OSC_PORT))
 
 
 # ══════════════════════════════════════════
 #  메인 루프
 # ══════════════════════════════════════════
-print("[시작] 'q' 종료 | 'k' 칼만 ON/OFF | 'n' Nano | 'm' Medium | 'g' GPU/CPU")
+print("[시작] 'q' 종료 | 'k' 칼만 ON/OFF | '[' ']' Q값 조절 | 'n' Nano | 'm' Medium | 'g' GPU/CPU")
+
+frame_count = 0
+rs_retry_count = 0
+MAX_RS_RETRIES = 5
 
 try:
     while True:
-        frames  = pipeline.wait_for_frames()
+        # ── RealSense 프레임 수신 (USB 끊김 대응) ──
+        try:
+            frames  = pipeline.wait_for_frames(timeout_ms=5000)
+            rs_retry_count = 0
+        except RuntimeError as e:
+            rs_retry_count += 1
+            print(f"[RealSense] 프레임 수신 실패 ({rs_retry_count}/{MAX_RS_RETRIES}): {e}")
+            if rs_retry_count >= MAX_RS_RETRIES:
+                print("[RealSense] 카메라 재연결 시도...")
+                try:
+                    pipeline.stop()
+                    time.sleep(2)
+                    profile = pipeline.start(config)
+                    rs_retry_count = 0
+                    print("[RealSense] 재연결 성공")
+                except Exception as re_err:
+                    print(f"[RealSense] 재연결 실패: {re_err}")
+                    time.sleep(3)
+            continue
+
         aligned = align.process(frames)
 
         color_frame = aligned.get_color_frame()
@@ -337,6 +407,17 @@ try:
             cv2.putText(color_image, "No Pose Detected", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
+        # ── 사라진 ID 칼만 필터 정리 (메모리 누수 방지) ──
+        current_track_ids = set()
+        if result.boxes.id is not None:
+            current_track_ids = set(result.boxes.id.int().cpu().tolist())
+        cleanup_stale_filters(current_track_ids)
+
+        # ── GPU 메모리 정리 (100프레임마다) ──
+        frame_count += 1
+        if frame_count % 100 == 0 and current_device == "cuda":
+            torch.cuda.empty_cache()
+
         # ── 상태 표시 (하단) ──
         model_label = YOLO_MODELS[current_model_key]
         device_label = current_device.upper()
@@ -357,6 +438,13 @@ try:
         cv2.putText(color_image, f"Device: {device_label} [G]",
                     (w - 175, 50),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, dev_color, 1)
+
+        # ── 칼만 Q 값 (우상단 3번째 줄) ──
+        if kalman_enabled:
+            q_color = (200, 200, 200)
+            cv2.putText(color_image, f"Q: {KALMAN_Q:.4f} [/]",
+                        (w - 175, 75),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, q_color, 1)
 
         # ── 화면 표시 ──
         display = np.hstack((color_image, depth_colormap))
@@ -389,6 +477,14 @@ try:
             kalman_filters.clear()
             kalman_filters_2d.clear()
             print(f"[Device] {current_device.upper()} 로 전환")
+        elif key == ord("]") and kalman_enabled:
+            new_q = min(KALMAN_Q * KALMAN_Q_STEP, KALMAN_Q_MAX)
+            update_all_kalman_q(new_q)
+            print(f"[Kalman] Q 증가: {KALMAN_Q:.4f} (반응↑ 스무딩↓)")
+        elif key == ord("[") and kalman_enabled:
+            new_q = max(KALMAN_Q / KALMAN_Q_STEP, KALMAN_Q_MIN)
+            update_all_kalman_q(new_q)
+            print(f"[Kalman] Q 감소: {KALMAN_Q:.4f} (반응↓ 스무딩↑)")
 
 finally:
     pipeline.stop()
