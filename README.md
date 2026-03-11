@@ -17,7 +17,8 @@ realsenseRetargeting/
 ├── d455_pose3d_osc.py          # MediaPipe: 다인원 포즈 추출 + OSC 송신 (27관절)
 ├── d455_yolo26_osc.py          # YOLO26:   다인원 포즈 추출 + OSC 송신 (17관절, GPU지원)
 ├── d455_pose3d_osc_release.py  # Release 빌드용 (exe)
-├── build_release.py            # PyInstaller Release 빌드 스크립트
+├── build_release.py            # PyInstaller Release 빌드 (MediaPipe 버전)
+├── build_yolo26_release.py     # PyInstaller Release 빌드 (YOLO26 버전)
 ├── create_launcher.py          # run_d455.bat 런처 파일 생성기
 ├── d455_pose3d.py              # 기본: 포즈 3D 시각화 (OSC 없음)
 ├── d455_viewer.py              # 카메라 뷰어 (컬러 + 깊이)
@@ -165,12 +166,21 @@ python d455_pose3d_osc.py
 ### Python — Release (exe)
 
 ```bash
-# 빌드
-python build_release.py
+# YOLO26 버전 빌드
+python build_yolo26_release.py
 
-# 실행 (conda 불필요)
-Release/D455_PoseOSC/D455_PoseOSC.exe
+# 실행 (conda 환경 불필요)
+Release/D455_YOLO26_PoseOSC/D455_YOLO26_PoseOSC.exe
 ```
+
+| 항목 | 내용 |
+|------|------|
+| 빌드 도구 | PyInstaller (onedir) |
+| 포함 파일 | exe, YOLO 모델(.pt), CUDA DLL, torch, pyrealsense2 등 |
+| GPU 지원 | CUDA DLL 포함 (RTX GPU 자동 사용) |
+| 모델 | yolo26n-pose.pt (Nano), yolo26m-pose.pt (Medium) |
+
+> MediaPipe 버전 빌드: `python build_release.py` → `Release/D455_PoseOSC/D455_PoseOSC.exe`
 
 ### Unreal Engine (OSC 수신 + 아바타 제어)
 
