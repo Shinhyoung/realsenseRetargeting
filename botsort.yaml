@@ -1,0 +1,17 @@
+# BoT-SORT + ReID 트래커 설정 (가림 후 재등장 시 ID 유지)
+tracker_type: botsort
+track_high_thresh: 0.25
+track_low_thresh: 0.1
+new_track_thresh: 0.25
+track_buffer: 120          # 기본 30 → 120 (~4초@30fps 동안 ID 유지)
+match_thresh: 0.8
+fuse_score: true
+
+# Global Motion Compensation
+gmc_method: sparseOptFlow
+
+# ReID (외형 기반 재식별)
+with_reid: true             # ReID 활성화
+proximity_thresh: 0.5
+appearance_thresh: 0.25     # 기본 0.8 → 0.25 (재매칭 민감도↑)
+model: auto

@@ -17,6 +17,8 @@ OSC 메시지 형식:
 
 import time
 import sys
+import os
+import datetime
 import tkinter as tk
 from tkinter import ttk
 import torch
@@ -421,9 +423,56 @@ def send_osc_bundle(track_id: int, joint_data: dict):
 
 
 # ══════════════════════════════════════════
+#  OSC 데이터 녹화 (txt 파일 저장)
+# ══════════════════════════════════════════
+recording = False
+record_file = None
+record_start_time = 0.0
+record_frame_count = 0
+
+
+def start_recording():
+    """녹화 시작 — 타임스탬프 파일명으로 txt 생성"""
+    global recording, record_file, record_start_time, record_frame_count
+    os.makedirs("recordings", exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filepath = f"recordings/osc_stream_{ts}.txt"
+    record_file = open(filepath, "w", encoding="utf-8")
+    record_file.write(f"# OSC Data Recording — {ts}\n")
+    record_file.write(f"# Format: timestamp(s) address x y z\n")
+    record_file.write(f"# Coordinate: RealSense camera origin (m)\n\n")
+    record_start_time = time.time()
+    record_frame_count = 0
+    recording = True
+    print(f"[REC] 녹화 시작: {filepath}")
+
+
+def stop_recording():
+    """녹화 종료 — 파일 닫기"""
+    global recording, record_file
+    if record_file:
+        record_file.write(f"\n# Total frames: {record_frame_count}\n")
+        record_file.close()
+        print(f"[REC] 녹화 종료 ({record_frame_count} 프레임 저장)")
+    record_file = None
+    recording = False
+
+
+def record_osc_data(track_id: int, joint_data: dict):
+    """현재 프레임의 OSC 데이터를 txt에 기록"""
+    global record_frame_count
+    if not recording or record_file is None:
+        return
+    t = time.time() - record_start_time
+    for name, (x, y, z) in joint_data.items():
+        record_file.write(f"{t:.4f}\t/pose/{track_id}/{name}\t{x:.6f}\t{y:.6f}\t{z:.6f}\n")
+    record_frame_count += 1
+
+
+# ══════════════════════════════════════════
 #  메인 루프
 # ══════════════════════════════════════════
-print("[시작] 'q' 종료 | 'k' 칼만 | '[' ']' Q값 | 'i' IR전환 | '+' '-' IR노출 | 'a' 자동노출 | 'n' Nano | 'm' Medium | 'g' GPU/CPU")
+print("[시작] 'q' 종료 | 'k' 칼만 | '[' ']' Q값 | 'i' IR전환 | '+' '-' IR노출 | 'a' 자동노출 | 'n' Nano | 'm' Medium | 'g' GPU/CPU | 'r' 녹화")
 
 frame_count = 0
 rs_retry_count = 0
@@ -507,6 +556,7 @@ try:
             yolo_input,
             persist=True,
             conf=CONF_THRESHOLD,
+            tracker="botsort.yaml",
             verbose=False,
         )
         infer_time_ms = (time.time() - t_infer_start) * 1000
@@ -611,6 +661,7 @@ try:
                 if joint_data:
                     try:
                         send_osc_bundle(track_id, joint_data)
+                        record_osc_data(track_id, joint_data)
                     except Exception as e:
                         print(f"[OSC] ID:{track_id} 송신 오류: {e}")
 
@@ -678,7 +729,19 @@ try:
                     (10, h - 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, fps_color, 1)
 
-        # ── IR 노출 표시 (우상단 5번째 줄, IR 모드일 때만) ──
+        # ── 녹화 상태 표시 (우상단 5번째 줄) ──
+        if recording:
+            rec_elapsed = time.time() - record_start_time
+            rec_text = f"REC {rec_elapsed:.1f}s  F:{record_frame_count} [R]"
+            cv2.putText(display_image, rec_text,
+                        (w - 220, 125),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 2)
+        else:
+            cv2.putText(display_image, "REC: OFF [R]",
+                        (w - 175, 125),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 150, 150), 1)
+
+        # ── IR 노출 표시 (우상단 6번째 줄, IR 모드일 때만) ──
         if use_ir and ir_sensor is not None:
             if ir_auto_exposure:
                 exp_text = "Exp: Auto [A]  [+/-]"
@@ -687,7 +750,7 @@ try:
                 exp_text = f"Exp: {ir_exposure_val} [A]  [+/-]"
                 exp_color = (0, 200, 255)
             cv2.putText(display_image, exp_text,
-                        (w - 220, 125),
+                        (w - 220, 150),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, exp_color, 1)
 
         # ── 화면 표시 ──
@@ -746,8 +809,15 @@ try:
             toggle_ir_auto_exposure()
             label = "Auto" if ir_auto_exposure else f"Manual ({ir_exposure_val})"
             print(f"[IR] 노출: {label}")
+        elif key == ord("r"):
+            if recording:
+                stop_recording()
+            else:
+                start_recording()
 
 finally:
+    if recording:
+        stop_recording()
     pipeline.stop()
     cv2.destroyAllWindows()
     print("[완료] 프로그램 종료")
