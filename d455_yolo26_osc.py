@@ -22,7 +22,6 @@ import datetime
 import tkinter as tk
 from tkinter import ttk
 import torch
-import pyrealsense2 as rs
 import numpy as np
 import cv2
 from ultralytics import YOLO
@@ -31,11 +30,62 @@ from pythonosc.osc_bundle_builder import OscBundleBuilder
 from pythonosc.osc_message_builder import OscMessageBuilder
 import pythonosc.osc_bundle_builder as osc_bundle_builder
 
+# pyrealsense2는 선택적 import (웹카메라 전용 PC에서는 없을 수 있음)
+try:
+    import pyrealsense2 as rs
+    RS_AVAILABLE = True
+except ImportError:
+    RS_AVAILABLE = False
+
+
+# ══════════════════════════════════════════
+#  카메라 감지
+# ══════════════════════════════════════════
+def detect_cameras():
+    """연결된 카메라를 감지하여 목록 반환
+    Returns: list of dict: {type, name, index/serial}
+    """
+    cameras = []
+
+    # RealSense 감지
+    if RS_AVAILABLE:
+        try:
+            ctx = rs.context()
+            for dev in ctx.query_devices():
+                cam_name = dev.get_info(rs.camera_info.name)
+                serial = dev.get_info(rs.camera_info.serial_number)
+                cameras.append({
+                    "type": "realsense",
+                    "name": cam_name,
+                    "serial": serial,
+                })
+        except Exception:
+            pass
+
+    # 웹카메라 감지 (OpenCV)
+    for idx in range(5):  # 최대 5개 스캔
+        cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+        if cap.isOpened():
+            # RealSense가 이미 검출된 경우 중복 제외
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            cameras.append({
+                "type": "webcam",
+                "name": f"Webcam #{idx} ({w}x{h})",
+                "index": idx,
+            })
+            cap.release()
+        else:
+            cap.release()
+            break  # 연속 번호이므로 없으면 중단
+
+    return cameras
+
 
 # ══════════════════════════════════════════
 #  시작 설정 창 (tkinter)
 # ══════════════════════════════════════════
-def show_settings_dialog():
+def show_settings_dialog(cameras: list):
     """시작 시 설정 창을 표시하고 사용자 입력을 반환"""
     settings = {"ok": False}
 
@@ -44,7 +94,7 @@ def show_settings_dialog():
     root.resizable(False, False)
 
     # 창을 화면 중앙에 배치
-    win_w, win_h = 400, 300
+    win_w, win_h = 400, 380
     screen_w = root.winfo_screenwidth()
     screen_h = root.winfo_screenheight()
     x = (screen_w - win_w) // 2
@@ -62,49 +112,102 @@ def show_settings_dialog():
     ttk.Label(frame, text="Motion Retargeting",
               font=("Segoe UI", 14, "bold")).grid(row=0, column=0, columnspan=2, pady=(0, 15))
 
+    # 카메라 선택
+    ttk.Label(frame, text="카메라:").grid(row=1, column=0, sticky="e", padx=(0, 10), pady=4)
+    cam_names = [c["name"] for c in cameras] if cameras else ["카메라 없음"]
+    cam_var = tk.StringVar(value=cam_names[0])
+    cam_combo = ttk.Combobox(frame, textvariable=cam_var, values=cam_names,
+                             state="readonly", width=28)
+    cam_combo.grid(row=1, column=1, sticky="w", pady=4)
+
+    # 카메라 타입 라벨
+    def get_selected_cam():
+        idx = cam_combo.current()
+        if idx < 0 or not cameras:
+            return None
+        return cameras[idx]
+
+    cam_type_var = tk.StringVar()
+
+    def update_cam_type(*_args):
+        cam = get_selected_cam()
+        if cam is None:
+            cam_type_var.set("감지된 카메라 없음")
+            is_rs = False
+        elif cam["type"] == "realsense":
+            cam_type_var.set(f"RealSense (S/N: {cam['serial']})")
+            is_rs = True
+        else:
+            cam_type_var.set("웹카메라 (Depth/IR 사용 불가)")
+            is_rs = False
+        # IR 옵션 활성화/비활성화
+        state = "normal" if is_rs else "disabled"
+        ir_radio_color.configure(state=state)
+        ir_radio_ir.configure(state=state)
+        dot_check.configure(state=state)
+        if not is_rs:
+            ir_var.set(False)
+            dot_var.set(False)
+
+    cam_type_label = ttk.Label(frame, textvariable=cam_type_var, foreground="gray",
+                               font=("Segoe UI", 8))
+    cam_type_label.grid(row=2, column=0, columnspan=2, pady=(0, 4))
+
     # OSC IP
-    ttk.Label(frame, text="OSC IP:").grid(row=1, column=0, sticky="e", padx=(0, 10), pady=4)
+    ttk.Label(frame, text="OSC IP:").grid(row=3, column=0, sticky="e", padx=(0, 10), pady=4)
     ip_var = tk.StringVar(value="127.0.0.1")
     ip_entry = ttk.Entry(frame, textvariable=ip_var, width=20)
-    ip_entry.grid(row=1, column=1, sticky="w", pady=4)
+    ip_entry.grid(row=3, column=1, sticky="w", pady=4)
 
     # OSC Port
-    ttk.Label(frame, text="OSC Port:").grid(row=2, column=0, sticky="e", padx=(0, 10), pady=4)
+    ttk.Label(frame, text="OSC Port:").grid(row=4, column=0, sticky="e", padx=(0, 10), pady=4)
     port_var = tk.StringVar(value="9000")
     port_entry = ttk.Entry(frame, textvariable=port_var, width=20)
-    port_entry.grid(row=2, column=1, sticky="w", pady=4)
+    port_entry.grid(row=4, column=1, sticky="w", pady=4)
 
     # IR 모드
-    ttk.Label(frame, text="입력 영상:").grid(row=3, column=0, sticky="e", padx=(0, 10), pady=4)
+    ttk.Label(frame, text="입력 영상:").grid(row=5, column=0, sticky="e", padx=(0, 10), pady=4)
     ir_var = tk.BooleanVar(value=False)
-    ir_frame = ttk.Frame(frame)
-    ir_frame.grid(row=3, column=1, sticky="w", pady=4)
-    ttk.Radiobutton(ir_frame, text="Color (기본)", variable=ir_var, value=False).pack(side="left")
-    ttk.Radiobutton(ir_frame, text="IR", variable=ir_var, value=True).pack(side="left", padx=(10, 0))
+    ir_frame_w = ttk.Frame(frame)
+    ir_frame_w.grid(row=5, column=1, sticky="w", pady=4)
+    ir_radio_color = ttk.Radiobutton(ir_frame_w, text="Color (기본)", variable=ir_var, value=False)
+    ir_radio_color.pack(side="left")
+    ir_radio_ir = ttk.Radiobutton(ir_frame_w, text="IR", variable=ir_var, value=True)
+    ir_radio_ir.pack(side="left", padx=(10, 0))
 
     # IR 도트 프로젝터
     dot_var = tk.BooleanVar(value=False)
     dot_check = ttk.Checkbutton(frame, text="IR 도트 프로젝터 OFF (깨끗한 IR 영상)",
                                  variable=dot_var)
-    dot_check.grid(row=4, column=0, columnspan=2, pady=(4, 0))
+    dot_check.grid(row=6, column=0, columnspan=2, pady=(4, 0))
 
     # 안내 텍스트
-    ttk.Label(frame, text="실행 중 'I' 키로 Color/IR 전환 가능",
-              foreground="gray").grid(row=5, column=0, columnspan=2, pady=(8, 0))
+    ttk.Label(frame, text="실행 중 'I' 키로 Color/IR 전환 가능 (RealSense만)",
+              foreground="gray").grid(row=7, column=0, columnspan=2, pady=(8, 0))
+
+    # 카메라 선택 변경 이벤트
+    cam_combo.bind("<<ComboboxSelected>>", update_cam_type)
+    update_cam_type()  # 초기 상태 설정
 
     def on_start():
+        cam = get_selected_cam()
+        if cam is None:
+            ttk.Label(frame, text="카메라를 선택하세요", foreground="red").grid(
+                row=9, column=0, columnspan=2)
+            return
         try:
             port = int(port_var.get())
             if not (1 <= port <= 65535):
                 raise ValueError
         except ValueError:
             ttk.Label(frame, text="포트는 1~65535 숫자", foreground="red").grid(
-                row=7, column=0, columnspan=2)
+                row=9, column=0, columnspan=2)
             return
         settings["ip"] = ip_var.get().strip()
         settings["port"] = port
         settings["use_ir"] = ir_var.get()
         settings["dot_off"] = dot_var.get()
+        settings["camera"] = cam
         settings["ok"] = True
         root.destroy()
 
@@ -112,7 +215,7 @@ def show_settings_dialog():
         root.destroy()
 
     btn_frame = ttk.Frame(frame)
-    btn_frame.grid(row=6, column=0, columnspan=2, pady=(15, 0))
+    btn_frame.grid(row=8, column=0, columnspan=2, pady=(15, 0))
     ttk.Button(btn_frame, text="시작", command=on_start, width=12).pack(side="left", padx=5)
     ttk.Button(btn_frame, text="취소", command=on_cancel, width=12).pack(side="left", padx=5)
 
@@ -124,8 +227,16 @@ def show_settings_dialog():
     return settings
 
 
+# ── 카메라 감지 ──
+print("[CAM] 연결된 카메라 탐색 중...")
+detected_cameras = detect_cameras()
+for c in detected_cameras:
+    print(f"  - [{c['type'].upper()}] {c['name']}")
+if not detected_cameras:
+    print("[오류] 연결된 카메라를 찾을 수 없습니다")
+
 # ── 설정 창 표시 ──
-user_settings = show_settings_dialog()
+user_settings = show_settings_dialog(detected_cameras)
 if not user_settings["ok"]:
     print("[취소] 프로그램 종료")
     sys.exit(0)
@@ -134,8 +245,11 @@ OSC_IP = user_settings["ip"]
 OSC_PORT = user_settings["port"]
 use_ir = user_settings["use_ir"]
 dot_projector_off = user_settings["dot_off"]
+selected_camera = user_settings["camera"]
+use_realsense = selected_camera["type"] == "realsense"
 
-print(f"[설정] OSC={OSC_IP}:{OSC_PORT}  입력={'IR' if use_ir else 'Color'}"
+print(f"[설정] 카메라={selected_camera['name']}  OSC={OSC_IP}:{OSC_PORT}"
+      f"  입력={'IR' if use_ir else 'Color'}"
       f"{'  도트OFF' if dot_projector_off else ''}")
 
 # ══════════════════════════════════════════
@@ -295,45 +409,80 @@ model = load_model(current_model_key, current_device)
 print(f"[OSC] 송신 대상: {OSC_IP}:{OSC_PORT}")
 
 # ══════════════════════════════════════════
-#  RealSense 파이프라인 설정
+#  카메라 초기화 (RealSense / 웹카메라 분기)
 # ══════════════════════════════════════════
-pipeline = rs.pipeline()
-config   = rs.config()
-config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16,  30)
-config.enable_stream(rs.stream.infrared, 1, 640, 480, rs.format.y8, 30)
-
-align   = rs.align(rs.stream.color)
-profile = pipeline.start(config)
-
-# IR 도트 프로젝터 제어
-if dot_projector_off:
-    device = profile.get_device()
-    for sensor in device.sensors:
-        if sensor.supports(rs.option.emitter_enabled):
-            sensor.set_option(rs.option.emitter_enabled, 0)
-            print("[IR] 도트 프로젝터 OFF")
-
-# IR 센서 참조 (노출 조절용)
+pipeline = None
+config = None
+align = None
+profile = None
+color_intrinsics = None
 ir_sensor = None
-rs_device = profile.get_device()
-for sensor in rs_device.sensors:
-    if sensor.get_info(rs.camera_info.name) == "Stereo Module":
-        ir_sensor = sensor
-        break
+webcam_cap = None
+is_d435 = False
 
-# IR 노출 설정
 IR_EXPOSURE_MIN = 1
 IR_EXPOSURE_MAX = 165000
-IR_EXPOSURE_STEP = 500  # 고정 증감량 (μs)
+IR_EXPOSURE_STEP = 500
 ir_auto_exposure = True
-ir_exposure_val = 8500  # 기본값
+ir_exposure_val = 8500
 
-if ir_sensor and ir_sensor.supports(rs.option.exposure):
-    # 항상 Auto 노출로 시작
-    ir_sensor.set_option(rs.option.enable_auto_exposure, 1)
-    ir_auto_exposure = True
-    ir_exposure_val = int(ir_sensor.get_option(rs.option.exposure))
+if use_realsense:
+    pipeline = rs.pipeline()
+    config = rs.config()
+    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+    config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16,  30)
+    config.enable_stream(rs.stream.infrared, 1, 640, 480, rs.format.y8, 30)
+
+    align   = rs.align(rs.stream.color)
+    profile = pipeline.start(config)
+
+    # 카메라 모델 판별
+    rs_device = profile.get_device()
+    cam_name = rs_device.get_info(rs.camera_info.name)
+    is_d435 = "D435" in cam_name
+    print(f"[CAM] RealSense: {cam_name}")
+
+    # IR 도트 프로젝터 제어 — D435는 depth를 위해 항상 켜둠
+    if is_d435:
+        for sensor in rs_device.sensors:
+            if sensor.supports(rs.option.emitter_enabled):
+                sensor.set_option(rs.option.emitter_enabled, 1)
+                print("[IR] D435 감지 → 도트 프로젝터 ON (depth 필수)")
+    elif dot_projector_off:
+        for sensor in rs_device.sensors:
+            if sensor.supports(rs.option.emitter_enabled):
+                sensor.set_option(rs.option.emitter_enabled, 0)
+                print("[IR] 도트 프로젝터 OFF")
+
+    # IR 센서 참조 (노출 조절용)
+    for sensor in rs_device.sensors:
+        if sensor.get_info(rs.camera_info.name) == "Stereo Module":
+            ir_sensor = sensor
+            break
+
+    if ir_sensor and ir_sensor.supports(rs.option.exposure):
+        ir_sensor.set_option(rs.option.enable_auto_exposure, 1)
+        ir_auto_exposure = True
+        ir_exposure_val = int(ir_sensor.get_option(rs.option.exposure))
+
+    color_intrinsics = (
+        profile.get_stream(rs.stream.color)
+        .as_video_stream_profile()
+        .get_intrinsics()
+    )
+else:
+    # 웹카메라 초기화
+    webcam_idx = selected_camera["index"]
+    webcam_cap = cv2.VideoCapture(webcam_idx, cv2.CAP_DSHOW)
+    webcam_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    webcam_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    webcam_cap.set(cv2.CAP_PROP_FPS, 30)
+    if not webcam_cap.isOpened():
+        print(f"[오류] 웹카메라 #{webcam_idx} 열기 실패")
+        sys.exit(1)
+    print(f"[CAM] 웹카메라: {selected_camera['name']}")
+    # 웹카메라는 IR/Depth 없음
+    use_ir = False
 
 
 def set_ir_exposure(value: float):
@@ -342,18 +491,15 @@ def set_ir_exposure(value: float):
     if ir_sensor is None:
         return
     if ir_auto_exposure:
-        # 현재 자동 노출 값을 기준으로 시작
         ir_exposure_val = int(ir_sensor.get_option(rs.option.exposure))
         ir_auto_exposure = False
         ir_sensor.set_option(rs.option.enable_auto_exposure, 0)
-        # value를 현재 auto 값 기준으로 재계산
         if value > ir_exposure_val:
             value = ir_exposure_val + IR_EXPOSURE_STEP
         else:
             value = ir_exposure_val - IR_EXPOSURE_STEP
     clamped = max(IR_EXPOSURE_MIN, min(int(value), IR_EXPOSURE_MAX))
     ir_sensor.set_option(rs.option.exposure, clamped)
-    # 실제 적용된 값 확인
     ir_exposure_val = int(ir_sensor.get_option(rs.option.exposure))
 
 
@@ -366,13 +512,6 @@ def toggle_ir_auto_exposure():
     ir_sensor.set_option(rs.option.enable_auto_exposure, 1 if ir_auto_exposure else 0)
     if not ir_auto_exposure:
         ir_exposure_val = int(ir_sensor.get_option(rs.option.exposure))
-
-
-color_intrinsics = (
-    profile.get_stream(rs.stream.color)
-    .as_video_stream_profile()
-    .get_intrinsics()
-)
 
 # 칼만 필터: {track_id: {joint_name: JointKalmanFilter}}
 kalman_filters: dict[int, dict[str, JointKalmanFilter]] = {}
@@ -398,6 +537,56 @@ def cleanup_stale_filters(current_ids: set):
         kalman_filters.pop(tid, None)
         kalman_filters_2d.pop(tid, None)
         kalman_last_seen.pop(tid, None)
+
+
+# ══════════════════════════════════════════
+#  관절 송신 필터: 누락 관절 보간 + 비율 임계값
+# ══════════════════════════════════════════
+# 리타겟팅 필수 관절 (이것들이 모두 있어야 의미 있는 포즈)
+REQUIRED_JOINTS = {
+    "L_Shoulder", "R_Shoulder", "L_Hip", "R_Hip",
+    "L_Elbow", "R_Elbow", "L_Wrist", "R_Wrist",
+    "L_Knee", "R_Knee",
+}
+MIN_JOINT_RATIO = 0.7          # 17개 중 70% (12개) 이상 유효해야 전송
+JOINT_CACHE_TIMEOUT = 0.5      # 초: 마지막 유효값 유지 시간
+
+# {track_id: {joint_name: (x, y, z, timestamp)}}
+joint_cache: dict[int, dict[str, tuple]] = {}
+
+
+def fill_missing_joints(track_id: int, joint_data: dict) -> dict:
+    """누락 관절을 캐시(마지막 유효값)로 채우고, 캐시 업데이트"""
+    now = time.time()
+
+    if track_id not in joint_cache:
+        joint_cache[track_id] = {}
+    cache = joint_cache[track_id]
+
+    # 현재 유효 관절 → 캐시 갱신
+    for name, coords in joint_data.items():
+        cache[name] = (*coords, now)
+
+    # 누락 관절 → 캐시에서 보간
+    filled = dict(joint_data)
+    for name in KEYPOINT_NAMES:
+        if name in filled:
+            continue
+        if name in cache:
+            x, y, z, ts = cache[name]
+            if now - ts <= JOINT_CACHE_TIMEOUT:
+                filled[name] = (x, y, z)
+            else:
+                del cache[name]  # 타임아웃 → 캐시 제거
+
+    return filled
+
+
+def cleanup_joint_cache(current_ids: set):
+    """사라진 track_id의 관절 캐시 정리"""
+    stale = [tid for tid in joint_cache if tid not in current_ids]
+    for tid in stale:
+        joint_cache.pop(tid, None)
 
 
 # ══════════════════════════════════════════
@@ -472,7 +661,10 @@ def record_osc_data(track_id: int, joint_data: dict):
 # ══════════════════════════════════════════
 #  메인 루프
 # ══════════════════════════════════════════
-print("[시작] 'q' 종료 | 'k' 칼만 | '[' ']' Q값 | 'i' IR전환 | '+' '-' IR노출 | 'a' 자동노출 | 'n' Nano | 'm' Medium | 'g' GPU/CPU | 'r' 녹화")
+if use_realsense:
+    print("[시작] 'q' 종료 | 'k' 칼만 | '[' ']' Q값 | 'i' IR전환 | '+' '-' IR노출 | 'a' 자동노출 | 'n' Nano | 'm' Medium | 'g' GPU/CPU | 'r' 녹화")
+else:
+    print("[시작] 'q' 종료 | 'k' 칼만 | '[' ']' Q값 | 'n' Nano | 'm' Medium | 'g' GPU/CPU | 'r' 녹화  (웹카메라: IR/Depth 비활성)")
 
 frame_count = 0
 rs_retry_count = 0
@@ -488,59 +680,71 @@ infer_time_ms = 0.0
 
 try:
     while True:
-        # ── RealSense 프레임 수신 (USB 끊김 대응) ──
-        try:
-            frames  = pipeline.wait_for_frames(timeout_ms=5000)
-            rs_retry_count = 0
-        except RuntimeError as e:
-            rs_retry_count += 1
-            print(f"[RealSense] 프레임 수신 실패 ({rs_retry_count}/{MAX_RS_RETRIES}): {e}")
-            if rs_retry_count >= MAX_RS_RETRIES:
-                rs_reconnect_count += 1
-                if rs_reconnect_count > MAX_RS_RECONNECTS:
-                    print(f"[RealSense] 재연결 {MAX_RS_RECONNECTS}회 초과 — 프로그램 종료")
-                    break
-                print(f"[RealSense] 카메라 재연결 시도 ({rs_reconnect_count}/{MAX_RS_RECONNECTS})...")
-                try:
-                    pipeline.stop()
-                    time.sleep(2)
-                    profile = pipeline.start(config)
-                    color_intrinsics = (
-                        profile.get_stream(rs.stream.color)
-                        .as_video_stream_profile()
-                        .get_intrinsics()
-                    )
-                    rs_retry_count = 0
-                    rs_reconnect_count = 0  # 성공 시 카운터 리셋
-                    print("[RealSense] 재연결 성공 (intrinsics 갱신)")
-                except Exception as re_err:
-                    print(f"[RealSense] 재연결 실패: {re_err}")
-                    time.sleep(3)
-            continue
+        depth_frame = None
+        ir_frame = None
+        ir_bgr = None
+        depth_image = None
 
-        aligned = align.process(frames)
+        if use_realsense:
+            # ── RealSense 프레임 수신 (USB 끊김 대응) ──
+            try:
+                frames  = pipeline.wait_for_frames(timeout_ms=5000)
+                rs_retry_count = 0
+            except RuntimeError as e:
+                rs_retry_count += 1
+                print(f"[RealSense] 프레임 수신 실패 ({rs_retry_count}/{MAX_RS_RETRIES}): {e}")
+                if rs_retry_count >= MAX_RS_RETRIES:
+                    rs_reconnect_count += 1
+                    if rs_reconnect_count > MAX_RS_RECONNECTS:
+                        print(f"[RealSense] 재연결 {MAX_RS_RECONNECTS}회 초과 — 프로그램 종료")
+                        break
+                    print(f"[RealSense] 카메라 재연결 시도 ({rs_reconnect_count}/{MAX_RS_RECONNECTS})...")
+                    try:
+                        pipeline.stop()
+                        time.sleep(2)
+                        profile = pipeline.start(config)
+                        color_intrinsics = (
+                            profile.get_stream(rs.stream.color)
+                            .as_video_stream_profile()
+                            .get_intrinsics()
+                        )
+                        rs_retry_count = 0
+                        rs_reconnect_count = 0
+                        print("[RealSense] 재연결 성공 (intrinsics 갱신)")
+                    except Exception as re_err:
+                        print(f"[RealSense] 재연결 실패: {re_err}")
+                        time.sleep(3)
+                continue
 
-        color_frame = aligned.get_color_frame()
-        depth_frame = aligned.get_depth_frame()
-        ir_frame    = frames.get_infrared_frame(1)
-        if not color_frame or not depth_frame:
-            continue
+            aligned = align.process(frames)
+            color_frame = aligned.get_color_frame()
+            depth_frame = aligned.get_depth_frame()
+            ir_frame    = frames.get_infrared_frame(1)
+            if not color_frame or not depth_frame:
+                continue
 
-        color_image = np.asanyarray(color_frame.get_data())
-        depth_image = np.asanyarray(depth_frame.get_data())
-        h, w = color_image.shape[:2]
+            color_image = np.asanyarray(color_frame.get_data())
+            depth_image = np.asanyarray(depth_frame.get_data())
+            h, w = color_image.shape[:2]
 
-        # ── IR 영상 처리 ──
-        if ir_frame:
-            ir_raw = np.asanyarray(ir_frame.get_data())
-            # IR → 3채널 BGR (YOLO 입력 + 화면 표시용)
-            ir_normalized = cv2.normalize(ir_raw, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-            ir_bgr = cv2.cvtColor(ir_normalized, cv2.COLOR_GRAY2BGR)
-            # IR 해상도를 컬러에 맞춤
-            if ir_bgr.shape[:2] != (h, w):
-                ir_bgr = cv2.resize(ir_bgr, (w, h))
+            # ── IR 영상 처리 ──
+            if ir_frame:
+                ir_raw = np.asanyarray(ir_frame.get_data())
+                ir_normalized = cv2.normalize(ir_raw, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                ir_bgr = cv2.cvtColor(ir_normalized, cv2.COLOR_GRAY2BGR)
+                if ir_bgr.shape[:2] != (h, w):
+                    ir_bgr = cv2.resize(ir_bgr, (w, h))
         else:
-            ir_bgr = None
+            # ── 웹카메라 프레임 수신 ──
+            ret, color_image = webcam_cap.read()
+            if not ret:
+                rs_retry_count += 1
+                if rs_retry_count >= MAX_RS_RETRIES:
+                    print("[Webcam] 프레임 수신 실패 — 프로그램 종료")
+                    break
+                continue
+            rs_retry_count = 0
+            h, w = color_image.shape[:2]
 
         # ── YOLO 입력 영상 선택 ──
         if use_ir and ir_bgr is not None:
@@ -562,10 +766,13 @@ try:
         infer_time_ms = (time.time() - t_infer_start) * 1000
 
         # ── 깊이 JET 컬러맵 ──
-        depth_colormap = cv2.applyColorMap(
-            cv2.convertScaleAbs(depth_image, alpha=0.03),
-            cv2.COLORMAP_JET,
-        )
+        if depth_image is not None:
+            depth_colormap = cv2.applyColorMap(
+                cv2.convertScaleAbs(depth_image, alpha=0.03),
+                cv2.COLORMAP_JET,
+            )
+        else:
+            depth_colormap = None
 
         detected_count = 0
         result = results[0]
@@ -618,7 +825,7 @@ try:
                     if conf > 0.3:
                         cv2.circle(display_image, (px, py), 4, color, -1)
 
-                # ── 전신 3D 좌표 계산 + OSC 송신 ──
+                # ── 좌표 계산 + OSC 송신 ──
                 joint_data = {}
                 y_offset = 25 + person_idx * 170
 
@@ -630,13 +837,22 @@ try:
                     px_c = max(0, min(px, w - 1))
                     py_c = max(0, min(py, h - 1))
 
-                    depth_val = depth_frame.get_distance(px_c, py_c)
-                    point_3d  = rs.rs2_deproject_pixel_to_point(
-                        color_intrinsics, [px_c, py_c], depth_val
-                    )
-                    x3, y3, z3 = point_3d
+                    if use_realsense and depth_frame is not None:
+                        # RealSense: 3D 좌표 (미터)
+                        depth_val = depth_frame.get_distance(px_c, py_c)
+                        point_3d  = rs.rs2_deproject_pixel_to_point(
+                            color_intrinsics, [px_c, py_c], depth_val
+                        )
+                        x3, y3, z3 = point_3d
+                        valid = depth_val > 0.0
+                    else:
+                        # 웹카메라: 정규화된 2D 좌표 (0~1), z=0
+                        x3 = px_c / w
+                        y3 = py_c / h
+                        z3 = 0.0
+                        valid = True
 
-                    if depth_val > 0.0:
+                    if valid:
                         if kalman_enabled:
                             kf = kalman_filters[track_id]
                             if name not in kf:
@@ -657,13 +873,50 @@ try:
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
                         y_offset += 15
 
-                # ── OSC 송신 ──
-                if joint_data:
+                # ── OSC 송신 (누락 관절 보간 + 비율 필터) ──
+                filled = fill_missing_joints(track_id, joint_data)
+                num_filled = len(filled)
+                ratio = num_filled / len(KEYPOINT_NAMES)
+                has_required = REQUIRED_JOINTS.issubset(filled.keys())
+                send_ok = ratio >= MIN_JOINT_RATIO and has_required
+
+                if send_ok:
                     try:
-                        send_osc_bundle(track_id, joint_data)
-                        record_osc_data(track_id, joint_data)
+                        send_osc_bundle(track_id, filled)
+                        record_osc_data(track_id, filled)
                     except Exception as e:
                         print(f"[OSC] ID:{track_id} 송신 오류: {e}")
+
+                # ── 송신 상태 화면 표시 ──
+                # Nose 위치 근처에 상태 배지 표시
+                nose_px = filtered_px[0]  # (x, y, conf)
+                if nose_px[2] > 0.3:
+                    badge_x = nose_px[0] + 8
+                    badge_y = nose_px[1] + 20
+                else:
+                    badge_x = 10
+                    badge_y = y_offset + 5
+
+                missing = REQUIRED_JOINTS - filled.keys()
+                cached_count = num_filled - len(joint_data)
+
+                if send_ok:
+                    status_text = f"SEND {num_filled}/17"
+                    status_color = (0, 255, 0)  # 초록
+                    if cached_count > 0:
+                        status_text += f" (cache:{cached_count})"
+                        status_color = (0, 255, 200)  # 연두
+                else:
+                    status_text = f"BLOCK {num_filled}/17"
+                    status_color = (0, 0, 255)  # 빨강
+                    if missing:
+                        miss_str = ",".join(sorted(missing)[:3])
+                        if len(missing) > 3:
+                            miss_str += f"+{len(missing)-3}"
+                        status_text += f" miss:{miss_str}"
+
+                cv2.putText(display_image, status_text, (badge_x, badge_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, status_color, 1)
 
         else:
             cv2.putText(display_image, "No Pose Detected", (10, 30),
@@ -674,6 +927,7 @@ try:
         if result.boxes.id is not None:
             current_track_ids = set(result.boxes.id.int().cpu().tolist())
         cleanup_stale_filters(current_track_ids)
+        cleanup_joint_cache(current_track_ids)
 
         # ── FPS 측정 ──
         frame_count += 1
@@ -692,8 +946,11 @@ try:
         model_label = YOLO_MODELS[current_model_key]
         device_label = current_device.upper()
         input_label = "IR" if use_ir else "Color"
-        cv2.putText(display_image,
-                    f"{model_label} ({device_label}) | {input_label} | OSC -> {OSC_IP}:{OSC_PORT}  Persons:{detected_count}  [N]ano [M]edium [G]PU [I]R",
+        if use_realsense:
+            status_bar = f"{model_label} ({device_label}) | {input_label} | OSC -> {OSC_IP}:{OSC_PORT}  Persons:{detected_count}  [N]ano [M]edium [G]PU [I]R"
+        else:
+            status_bar = f"{model_label} ({device_label}) | Webcam | OSC -> {OSC_IP}:{OSC_PORT}  Persons:{detected_count}  [N]ano [M]edium [G]PU"
+        cv2.putText(display_image, status_bar,
                     (10, h - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.33, (255, 200, 0), 1)
 
@@ -718,10 +975,15 @@ try:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, q_color, 1)
 
         # ── 입력 소스 표시 (우상단 4번째 줄) ──
-        ir_color = (0, 200, 255) if use_ir else (200, 200, 200)
-        cv2.putText(display_image, f"Input: {input_label} [I]",
-                    (w - 175, 100),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, ir_color, 1)
+        if use_realsense:
+            ir_color = (0, 200, 255) if use_ir else (200, 200, 200)
+            cv2.putText(display_image, f"Input: {input_label} [I]",
+                        (w - 175, 100),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, ir_color, 1)
+        else:
+            cv2.putText(display_image, "Input: Webcam (2D)",
+                        (w - 195, 100),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
 
         # ── FPS + 추론 시간 표시 (좌상단) ──
         fps_color = (0, 255, 0) if current_fps >= 25 else (0, 200, 255) if current_fps >= 15 else (0, 0, 255)
@@ -741,8 +1003,8 @@ try:
                         (w - 175, 125),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 150, 150), 1)
 
-        # ── IR 노출 표시 (우상단 6번째 줄, IR 모드일 때만) ──
-        if use_ir and ir_sensor is not None:
+        # ── IR 노출 표시 (우상단 6번째 줄, RealSense IR 모드일 때만) ──
+        if use_realsense and use_ir and ir_sensor is not None:
             if ir_auto_exposure:
                 exp_text = "Exp: Auto [A]  [+/-]"
                 exp_color = (0, 255, 100)
@@ -754,8 +1016,12 @@ try:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, exp_color, 1)
 
         # ── 화면 표시 ──
-        display = np.hstack((display_image, depth_colormap))
-        cv2.imshow("D455 YOLO26 Pose OSC | 'q' quit  'k' kalman  'i' IR", display)
+        if depth_colormap is not None:
+            display = np.hstack((display_image, depth_colormap))
+        else:
+            display = display_image
+        win_title = "YOLO26 Pose OSC | 'q' quit  'k' kalman" + ("  'i' IR" if use_realsense else "  (Webcam)")
+        cv2.imshow(win_title, display)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
@@ -792,20 +1058,20 @@ try:
             new_q = max(KALMAN_Q / KALMAN_Q_STEP, KALMAN_Q_MIN)
             update_all_kalman_q(new_q)
             print(f"[Kalman] Q 감소: {KALMAN_Q:.4f} (반응↓ 스무딩↑)")
-        elif key == ord("i"):
+        elif key == ord("i") and use_realsense:
             use_ir = not use_ir
             kalman_filters.clear()
             kalman_filters_2d.clear()
             kalman_last_seen.clear()
             label = "IR" if use_ir else "Color"
             print(f"[Input] {label} 모드로 전환")
-        elif key in (ord("="), ord("+")) and use_ir and ir_sensor is not None:
+        elif key in (ord("="), ord("+")) and use_realsense and use_ir and ir_sensor is not None:
             set_ir_exposure(ir_exposure_val + IR_EXPOSURE_STEP)
             print(f"[IR] 노출 증가: {ir_exposure_val}")
-        elif key == ord("-") and use_ir and ir_sensor is not None:
+        elif key == ord("-") and use_realsense and use_ir and ir_sensor is not None:
             set_ir_exposure(ir_exposure_val - IR_EXPOSURE_STEP)
             print(f"[IR] 노출 감소: {ir_exposure_val}")
-        elif key == ord("a") and use_ir and ir_sensor is not None:
+        elif key == ord("a") and use_realsense and use_ir and ir_sensor is not None:
             toggle_ir_auto_exposure()
             label = "Auto" if ir_auto_exposure else f"Manual ({ir_exposure_val})"
             print(f"[IR] 노출: {label}")
@@ -818,6 +1084,9 @@ try:
 finally:
     if recording:
         stop_recording()
-    pipeline.stop()
+    if pipeline is not None:
+        pipeline.stop()
+    if webcam_cap is not None:
+        webcam_cap.release()
     cv2.destroyAllWindows()
     print("[완료] 프로그램 종료")

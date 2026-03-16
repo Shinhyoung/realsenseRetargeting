@@ -83,7 +83,7 @@ def build():
     cmd = [
         "pyinstaller",
         "--noconfirm",
-        "--onedir",
+        "--onefile",
         "--console",
         "--name", APP_NAME,
         "--distpath", RELEASE_DIR,
